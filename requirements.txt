@@ -1,0 +1,4 @@
+# requirements.txt — backend-agnostic base deps (all BACKEND modes need these)
+pydantic
+requests
+tqdm

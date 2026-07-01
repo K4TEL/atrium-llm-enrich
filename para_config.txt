@@ -1,11 +1,11 @@
-# para_config.txt — atrium-nlp-enrich
+# para_config.txt — atrium-llm-enrich
 # Repository-specific paradata facts. Edit this file (not the Python) when
 # components or versions change.
 
 [tool]
-program = nlp-enrich
-version = v0.16.0
-repository_fallback = https://github.com/ufal/atrium-nlp-enrich
+program = llm-enrich
+version = v0.1.0
+repository_fallback = https://github.com/ufal/atrium-llm-enrich
 
 [components]
 # name = <license> ; <always|conditional> ; <role>
@@ -14,24 +14,24 @@ repository_fallback = https://github.com/ufal/atrium-nlp-enrich
 #                  (or, via the CLI shim, when `--component NAME` is passed to
 #                  `start`/`success`).
 #
-# License rationale (see ATRIUM issue #6 licensing breakdown):
-#   * The NameTag 3 and UDPipe 2 *engines* are MPL 2.0, accessed here only as
-#     hosted Lindat/CLARIAH-CZ APIs. The binding constraint is the pre-trained
-#     *models*: the Czech CNEC 2.0 tagger and the czech-pdt UD parser are both
-#     CC BY-NC-SA 4.0. Because the core enrichment pipeline (api_2_udp →
-#     api_3_nt → api_4_stats) always exercises both models, CC BY-NC-SA 4.0 is
-#     the project-wide floor for this repo — every core run is non-commercial
-#     AND share-alike.
-#   * KER (legacy lemma-frequency keyword extraction) is stdlib-only; it adds
-#     no third-party license, so the repo MIT base applies for KER-only runs.
-#   * YAKE is AGPL-3.0 (LIAAD/yake PyPI package); KeyBERT is MIT and pulls in
-#     sentence-transformers (Apache-2.0). These are conditional: they only
-#     constrain the optional keyword-extraction step that actually loads them.
-nametag3_models   = CC BY-NC-SA 4.0 ; always      ; NameTag 3 Czech CNEC 2.0 NER model (api_3_nt)
-udpipe2_models    = CC BY-NC-SA 4.0 ; always      ; UDPipe 2 czech-pdt UD model (api_2_udp)
-nametag3_engine   = MPL 2.0         ; conditional ; NameTag 3 engine (Lindat API, MPL 2.0)
-udpipe2_engine    = MPL 2.0         ; conditional ; UDPipe 2 engine (Lindat API, MPL 2.0)
-ker               = MIT             ; conditional ; legacy KER lemma-frequency keyword extraction (stdlib only)
-yake              = AGPL-3.0        ; conditional ; YAKE statistical keyword extraction (LIAAD/yake)
-keybert           = MIT             ; conditional ; KeyBERT embedding-based keyword extraction
-sentence_transformers = Apache-2.0  ; conditional ; sentence-transformers backbone for KeyBERT
+# TODO(K4TEL/DanaKriv): this section was inherited from atrium-nlp-enrich and
+# stripped of the NameTag3/UDPipe/YAKE/KeyBERT rows, which don't apply here
+# (this repo never loads those). It needs a real pass:
+#   * BACKEND=transformers/vllm — the effective license depends on which
+#     MODEL_KEY is selected at runtime (MODEL_REGISTRY spans Qwen
+#     Apache-2.0/Qwen-license, Gemma's Gemma-license, Llama's Llama-license,
+#     etc.) — not a single fixed "always" component like nlp-enrich's NER
+#     models were. Likely needs a per-model_key -> license lookup rather than
+#     a flat row here.
+#   * BACKEND=openrouter — routes to third-party model providers under their
+#     own terms; no single license applies. `PROVIDER_DATA_COLLECTION=deny`
+#     (see llm_config.txt) restricts routing to providers that don't retain
+#     prompts/completions, but does not by itself resolve licensing.
+#   * BACKEND=ollama — locally-served model, same per-model variability as
+#     the transformers/vllm case above.
+#   * flexiconv (api_util/flexiconv_convert.py) — license not yet checked
+#     against project policy; flag before enabling txt/pdf/docx conversion
+#     in a shared/production run.
+# Until this is reviewed, ParadataLogger falls back to its conservative
+# default (CC BY-NC 4.0) whenever no components are logged — see
+# atrium_paradata.py:_license_block().

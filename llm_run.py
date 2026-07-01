@@ -325,7 +325,7 @@ def main(config_path: str = "llm_config.txt") -> None:
     log_gpu_info()
 
     logger = ParadataLogger(
-        program="nlp-enrich",
+        program="llm-enrich",
         config={
             **config,
             "output_dir_resolved": str(OUTPUT_DIR),

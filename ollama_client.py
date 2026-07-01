@@ -1,0 +1,250 @@
+"""
+ollama_client.py — Local Ollama backend (BACKEND=ollama).
+
+The lightweight local alternative to the heavy transformers/vLLM path: talks
+to a locally-running ``ollama serve`` over HTTP instead of loading weights
+into this process. Reuses the same quality filter, context-window builder,
+archaeological schema, and validate_llm_output() as the transformers/vLLM
+engine (via llm_client_shared.py — see that module's docstring for why this
+is a duplicate front-end rather than an import of llm_utils.py/llm_run.py).
+
+Structured output uses Ollama's native ``format`` parameter (a JSON Schema
+object, supported since Ollama >= 0.5) — no external constrained-decoding
+library needed, unlike the transformers backend's lmformatenforcer.
+
+Two input modes, dispatched by file extension (same as openrouter_client.py):
+  * .csv / *.teitok.xml — line-level enrichment, one Ollama call per
+    qualifying line.
+  * .md / .txt           — whole-document enrichment, one Ollama call per
+    document; typically fed from api_util/xml_to_md.py output.
+
+Model-pull handling: if the requested model isn't in ``ollama list`` (via
+GET /api/tags), this triggers ``POST /api/pull`` and streams progress before
+the first inference call.
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+import requests
+from tqdm import tqdm
+
+from atrium_paradata import ParadataLogger
+from llm_client_shared import (
+    build_document_schema,
+    build_document_system_prompt,
+    build_schema,
+    build_system_prompt,
+    load_config,
+    run_document_level,
+    run_line_level,
+)
+from vocab_manager import VocabularyManager
+
+DEFAULT_OLLAMA_HOST = "http://localhost:11434"
+MAX_NEW_TOKENS = 2048  # mirrors llm_utils.MAX_NEW_TOKENS
+CONTEXT_RESERVED = MAX_NEW_TOKENS + 512
+_DOC_INPUT_EXTENSIONS = {".md", ".txt"}
+
+
+def ensure_model_pulled(host: str, model: str, session: requests.Session, timeout: int) -> None:
+    """Checks GET /api/tags; if `model` is missing, streams POST /api/pull."""
+    try:
+        resp = session.get(f"{host}/api/tags", timeout=timeout)
+        resp.raise_for_status()
+        available = {m.get("name") for m in resp.json().get("models", [])}
+    except requests.RequestException as exc:
+        raise RuntimeError(
+            f"Could not reach Ollama at {host} — is 'ollama serve' running? ({exc})"
+        ) from exc
+
+    # Ollama tags are often 'model:latest' — match on the bare name too.
+    if model in available or any(a.split(":")[0] == model.split(":")[0] for a in available):
+        return
+
+    print(f"[ollama] Model '{model}' not found locally — pulling…")
+    with session.post(f"{host}/api/pull", json={"name": model}, stream=True, timeout=None) as resp:
+        resp.raise_for_status()
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            try:
+                status = json.loads(line).get("status", "")
+            except json.JSONDecodeError:
+                continue
+            if status:
+                print(f"  [pull] {status}")
+    print(f"[ollama] Model '{model}' ready.")
+
+
+def make_chat_fn(
+    session: requests.Session,
+    host: str,
+    model: str,
+    schema: dict,
+    max_retries: int,
+    timeout: int,
+):
+    """Returns a llm_client_shared.ChatFn bound to this Ollama model/session."""
+
+    def chat_fn(messages: List[Dict[str, str]]) -> str:
+        body: Dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+            "format": schema,
+            "options": {"temperature": 0.0},
+        }
+
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                resp = session.post(f"{host}/api/chat", json=body, timeout=timeout)
+                if resp.status_code >= 500:
+                    raise requests.HTTPError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+                resp.raise_for_status()
+                data = resp.json()
+                return data["message"]["content"]
+            except (requests.RequestException, KeyError, ValueError) as exc:
+                last_exc = exc
+                if attempt < max_retries:
+                    time.sleep(min(2**attempt, 15))
+        raise RuntimeError(f"Ollama request failed after {max_retries} attempts: {last_exc}")
+
+    return chat_fn
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", default="llm_config.txt", help="Shared config file.")
+    parser.add_argument("--input", type=Path, default=None, help="File or directory (overrides INPUT_DIR).")
+    parser.add_argument("--output-dir", type=Path, default=None, help="Overrides OUTPUT_DIR.")
+    parser.add_argument("--model", default=None, help="Ollama model tag, e.g. 'qwen2.5:7b'.")
+    parser.add_argument("--host", default=None, help="Overrides OLLAMA_HOST / http://localhost:11434.")
+    parser.add_argument("--context-window", type=int, default=32_000, help="Model context window, for vocab-truncation budget.")
+    parser.add_argument("--skip-pull-check", action="store_true", help="Skip the /api/tags + auto-pull step.")
+    parser.add_argument("--max-retries", type=int, default=3)
+    parser.add_argument("--timeout", type=int, default=300, help="Per-request timeout — local inference can be slow on CPU.")
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    args = build_arg_parser().parse_args(argv)
+    config = load_config(args.config)
+
+    host = (args.host or os.environ.get("OLLAMA_HOST") or config.get("OLLAMA_HOST") or DEFAULT_OLLAMA_HOST).rstrip("/")
+    model = args.model or config.get("OLLAMA_MODEL")
+    if not model:
+        print("[ERROR] No model: pass --model or set OLLAMA_MODEL in llm_config.txt.", file=sys.stderr)
+        sys.exit(1)
+
+    input_path = args.input or Path(config.get("INPUT_DIR", "data_samples/DOC_LINE_LANG_CLASS"))
+    vocab_path = config.get("VOCAB_PATH", "data_samples/teater_nested_vocab.json")
+    paradata_dir = config.get("PARADATA_DIR", "paradata")
+
+    model_suffix = model.replace(":", "_").replace(".", "").replace("/", "_")
+    output_dir = args.output_dir or (
+        Path(config.get("OUTPUT_DIR", "data_samples/KW_PER_DOC_LLM")).parent
+        / f"{Path(config.get('OUTPUT_DIR', 'KW_PER_DOC_LLM')).name}_{model_suffix}"
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    include_non_text = config.get("INCLUDE_NON_TEXT", "true").lower() == "true"
+    min_char_count = int(config.get("MIN_CHAR_COUNT", "3"))
+    min_char_non_text = int(config.get("MIN_CHAR_NON_TEXT", "8"))
+    min_alpha_ratio_non_text = float(config.get("MIN_ALPHA_RATIO_NON_TEXT", "0.40"))
+
+    print(f"\n=== LLM Semantic Enrichment Pipeline (BACKEND=ollama) ===\n    host:    {host}\n    model:   {model}\n    output:  {output_dir}\n")
+
+    session = requests.Session()
+    if not args.skip_pull_check:
+        ensure_model_pulled(host, model, session, timeout=args.timeout)
+
+    logger = ParadataLogger(
+        program="llm-enrich",
+        config={**config, "backend": "ollama", "model": model, "host": host, "output_dir_resolved": str(output_dir)},
+        paradata_dir=paradata_dir,
+        output_types=["json"],
+    )
+
+    with logger:
+        vocab_mgr = VocabularyManager(vocab_path=vocab_path)
+        vocab_data = vocab_mgr.load()
+
+        max_input_tokens = args.context_window - CONTEXT_RESERVED
+        line_prompt, line_terms = build_system_prompt(vocab_data, max_tokens=max_input_tokens)
+        doc_prompt, doc_terms = build_document_system_prompt(vocab_data, max_tokens=max_input_tokens)
+        LineModel = build_schema(line_terms)
+        DocModel = build_document_schema(doc_terms)
+
+        line_chat_fn = make_chat_fn(session, host, model, LineModel.model_json_schema(), args.max_retries, args.timeout)
+        doc_chat_fn = make_chat_fn(session, host, model, DocModel.model_json_schema(), args.max_retries, args.timeout)
+
+        if input_path.is_file():
+            input_files = [input_path]
+        else:
+            input_files = sorted(
+                p
+                for p in input_path.iterdir()
+                if p.suffix.lower() in _DOC_INPUT_EXTENSIONS
+                or p.suffix.lower() == ".csv"
+                or p.name.lower().endswith(".teitok.xml")
+            )
+
+        total_processed = total_errors = total_aborted = 0
+        for f in tqdm(input_files, desc="Documents", unit="doc", dynamic_ncols=True):
+            doc_id = f.stem
+            out_file = output_dir / f"{doc_id}_enriched.json"
+            if out_file.exists():
+                logger.log_skip(f.name, "already_exists")
+                continue
+
+            try:
+                if f.suffix.lower() in _DOC_INPUT_EXTENSIONS:
+                    results, stats = run_document_level(f, doc_chat_fn, doc_prompt, DocModel)
+                else:
+                    results, stats = run_line_level(
+                        f,
+                        line_chat_fn,
+                        line_prompt,
+                        LineModel,
+                        include_non_text=include_non_text,
+                        min_char_count=min_char_count,
+                        min_char_non_text=min_char_non_text,
+                        min_alpha_ratio_non_text=min_alpha_ratio_non_text,
+                    )
+
+                total_processed += stats["processed"]
+                total_errors += stats["skipped_error"]
+                total_aborted += int(bool(stats.get("aborted")))
+
+                if results:
+                    with open(out_file, "w", encoding="utf-8") as out_f:
+                        json.dump(results, out_f, indent=4, ensure_ascii=False)
+                    tqdm.write(f"  -> {len(results)} records -> {out_file.name}")
+                    logger.log_success("json", count=1)
+                    logger.log_document_success()
+                else:
+                    logger.log_skip(f.name, "No records produced.")
+
+            except Exception as exc:
+                tqdm.write(f"  Critical error on {f.name}: {exc}")
+                logger.log_skip(f.name, str(exc))
+
+        print(
+            f"\n=== Run complete ===\n"
+            f"    records enriched:  {total_processed}\n"
+            f"    inference errors:  {total_errors}\n"
+            f"    aborted documents: {total_aborted}\n"
+            f"    files processed:   {len(input_files)}\n"
+        )
+        logger.finalize(input_total=len(input_files))
+
+
+if __name__ == "__main__":
+    main()

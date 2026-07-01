@@ -124,3 +124,19 @@ MIN_ALPHA_RATIO_NON_TEXT=0.4
 
 # Disable Automatic Prefix Caching — not recommended; reduces throughput.
 # ENABLE_PREFIX_CACHING=false
+
+# =============================================================================
+# Remote / lightweight-local backends (openrouter_client.py, ollama_client.py)
+# =============================================================================
+#
+# These two entry points are separate from llm_run.py (BACKEND=transformers/
+# vllm above) — they don't load local model weights, so requirements_remote.txt
+# is enough to run them (see requirements_remote.txt vs requirements_llm.txt).
+# Every knob below can also be passed as a CLI flag; CLI flags win.
+#
+# OPENROUTER_MODEL=openai/gpt-4o-mini
+# OPENROUTER_API_KEY=sk-or-v1-xxxxxxxxxxxxxxxxxxxx
+#
+# OLLAMA_MODEL=qwen2.5:7b
+# OLLAMA_HOST=http://localhost:11434
+
