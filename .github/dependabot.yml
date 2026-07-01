@@ -1,0 +1,23 @@
+# .github/dependabot.yml
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    target-branch: "test"
+    ignore:
+      # Pinned in requirements_llm.txt for tested compatibility with the
+      # vLLM/transformers guided-decoding stack — bump these by hand after
+      # verifying against the model registry, not via automated PRs.
+      - dependency-name: "torch"
+      - dependency-name: "vllm"
+      - dependency-name: "bitsandbytes"
+      - dependency-name: "transformers"
+        versions: [">=5.0.0"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    target-branch: "test"

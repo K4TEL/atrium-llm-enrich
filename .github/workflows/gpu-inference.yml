@@ -1,0 +1,63 @@
+# .github/workflows/gpu-inference.yml
+# GPU inference integration tests — runs on a self-hosted GPU runner.
+#
+# INFRA-GATED: This job stays queued/inert until a self-hosted runner is
+# registered with the [self-hosted, gpu] labels (ARUP/UFAL infra owner). It
+# never blocks PRs (manual-dispatch + weekly only).
+#
+# When active it exercises the local transformers/vLLM path (llm_run.py,
+# llm_utils.py) which requires requirements_llm.txt (torch, transformers,
+# bitsandbytes, vLLM). The GPU runner must have CUDA drivers installed.
+#
+# Exit-5 guard: same as scheduled-smoke.yml — tolerated until
+# @pytest.mark.slow GPU tests are written. Until then the job "passes" by
+# collecting no tests.
+#
+# HF_TOKEN: add as a repo/org secret to exercise gated HF models
+# (gemma-4-*, gemma-3-*, llama3.1-70b, llama4-maverick) in the slow suite.
+
+name: GPU Inference Tests
+
+on:
+  schedule:
+    # Weekly Monday 03:00 UTC (off-peak for shared cluster)
+    - cron: '0 3 * * 1'
+  workflow_dispatch:
+
+env:
+  REQUIREMENTS: "requirements.txt requirements_llm.txt"
+
+jobs:
+  gpu-inference:
+    name: GPU slow tests
+    runs-on: [self-hosted, gpu]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show GPU
+        run: nvidia-smi
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install base + LLM dependencies
+        run: |
+          pip install --upgrade pip
+          for req in ${{ env.REQUIREMENTS }}; do
+            if [ -f "$req" ]; then pip install -r "$req"; fi
+          done
+          pip install pytest
+
+      - name: Run GPU/slow-marked tests (exit-5 tolerant)
+        # Exit code 5 = "no tests collected" — tolerated until GPU slow tests exist.
+        # HF_TOKEN is injected if set, enabling gated model tests.
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python -m pytest -m slow -v --tb=short
+          rc=$?
+          [ "$rc" -eq 5 ] && echo "[gpu] No slow tests collected — OK (infra ready)" && exit 0 || exit $rc
