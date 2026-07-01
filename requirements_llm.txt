@@ -1,0 +1,17 @@
+ements_llm.txt 
+regex
+configparser
+tqdm
+requests
+bitsandbytes==0.49.2
+keybert
+openpyxl
+pandas
+pydantic==2.13.3
+Requests
+sentence_transformers==5.4.1
+torch==2.7.0
+transformers>=4.40.0
+yake
+vllm>=0.9.0
+
