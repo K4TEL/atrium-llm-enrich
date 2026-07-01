@@ -2,7 +2,7 @@
 FROM python:3.11-slim AS base
 
 ARG ATRIUM_RUNNER_IMAGE=""
-ARG ATRIUM_RUNNER_REPO="https://github.com/ufal/atrium-nlp-enrich"
+ARG ATRIUM_RUNNER_REPO="https://github.com/ufal/atrium-llm-enrich"
 ARG ATRIUM_RUNNER_REF=""
 
 ENV ATRIUM_RUNNER_IMAGE=${ATRIUM_RUNNER_IMAGE} \
@@ -16,44 +16,45 @@ ENV ATRIUM_RUNNER_IMAGE=${ATRIUM_RUNNER_IMAGE} \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
-        bash \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-COPY requirements.txt requirements-test.txt ./
-RUN pip install -r requirements.txt -r requirements-test.txt
+# Backend-agnostic base deps only (pydantic/requests/tqdm) — see requirements.txt.
+# Heavy (requirements_llm.txt) and light-remote (requirements_remote.txt) deps are
+# layered on in the two stages below, so neither pulls in the other's footprint.
+COPY requirements.txt ./
+RUN pip install -r requirements.txt
 
 COPY . .
 
-RUN chmod +x api_1_manifest.sh api_2_udp.sh api_3_nt.sh api_4_stats.sh \
-    && useradd --create-home --uid 10001 atrium \
+RUN useradd --create-home --uid 10001 atrium \
     && mkdir -p /cache/huggingface /data \
     && chown -R atrium:atrium /app /cache /data
 
 USER atrium
 
-ENTRYPOINT ["python", "run_pipeline.py"]
-CMD []
-
 
 # ---------------------------------------------------------------------------
-# API surface — published as :<version>-api
+# Remote / lightweight-local variant — published as :<version>-remote
+# For openrouter_client.py and ollama_client.py: no torch/transformers/vllm/
+# bitsandbytes (see requirements_remote.txt). No single default script — pass
+# one of the two client modules (+ its args) as the container command.
 # ---------------------------------------------------------------------------
-FROM base AS api
+FROM base AS remote
 
 USER root
-COPY service/requirements.txt ./service_requirements.txt
-RUN pip install -r service_requirements.txt
+COPY requirements_remote.txt ./
+RUN pip install -r requirements_remote.txt
 RUN chown -R atrium:atrium /app
 USER atrium
 
-EXPOSE 8000
-ENTRYPOINT ["uvicorn", "service.api:app", "--host", "0.0.0.0", "--port", "8000"]
+ENTRYPOINT ["python"]
+CMD ["openrouter_client.py", "--help"]
 
 
 # ---------------------------------------------------------------------------
-# Optional LLM/GPU variant — published as :<version>-llm
+# Local multi-GPU variant — published as :<version>-llm
 # ---------------------------------------------------------------------------
 FROM base AS llm
 
