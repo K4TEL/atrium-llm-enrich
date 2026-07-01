@@ -1,0 +1,49 @@
+services:
+  llm-enrich-remote:
+    profiles: [remote]
+    image: ghcr.io/ufal/atrium-llm-enrich:${ATRIUM_VERSION:-dev}-remote
+    build:
+      context: .
+      target: remote
+      args:
+        ATRIUM_RUNNER_IMAGE: ghcr.io/ufal/atrium-llm-enrich:${ATRIUM_VERSION:-dev}-remote
+        ATRIUM_RUNNER_REPO: https://github.com/ufal/atrium-llm-enrich
+        ATRIUM_RUNNER_REF: ${ATRIUM_RUNNER_REF:-dev}
+    environment:
+      ATRIUM_RUNNER_IMAGE: ghcr.io/ufal/atrium-llm-enrich:${ATRIUM_VERSION:-dev}-remote
+      ATRIUM_RUNNER_REPO: https://github.com/ufal/atrium-llm-enrich
+      ATRIUM_RUNNER_REF: ${ATRIUM_RUNNER_REF:-dev}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
+    volumes:
+      - ./data:/data
+      - ./llm_config.txt:/app/llm_config.txt:ro
+    # No single default entrypoint — override the command to pick a client, e.g.:
+    #   docker compose --profile remote run --rm llm-enrich-remote \
+    #     openrouter_client.py --input /data/sample.csv --model openai/gpt-4o-mini
+    #   docker compose --profile remote run --rm llm-enrich-remote \
+    #     ollama_client.py --input /data/sample.csv --model qwen2.5:7b
+
+  llm-enrich-llm:
+    profiles: [llm]
+    image: ghcr.io/ufal/atrium-llm-enrich:${ATRIUM_VERSION:-dev}-llm
+    build:
+      context: .
+      target: llm
+      args:
+        ATRIUM_RUNNER_IMAGE: ghcr.io/ufal/atrium-llm-enrich:${ATRIUM_VERSION:-dev}-llm
+        ATRIUM_RUNNER_REPO: https://github.com/ufal/atrium-llm-enrich
+        ATRIUM_RUNNER_REF: ${ATRIUM_RUNNER_REF:-dev}
+    environment:
+      ATRIUM_RUNNER_IMAGE: ghcr.io/ufal/atrium-llm-enrich:${ATRIUM_VERSION:-dev}-llm
+      ATRIUM_RUNNER_REPO: https://github.com/ufal/atrium-llm-enrich
+      ATRIUM_RUNNER_REF: ${ATRIUM_RUNNER_REF:-dev}
+      HF_HOME: /cache/huggingface
+      HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+      - ./data:/data
+      - hf-cache:/cache/huggingface
+      - ./llm_config.txt:/app/llm_config.txt:ro
+
+volumes:
+  hf-cache:
