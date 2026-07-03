@@ -30,7 +30,7 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import requests
 from tqdm import tqdm
@@ -189,10 +189,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     paradata_dir = config.get("PARADATA_DIR", "paradata")
 
     model_suffix = model.replace("/", "_").replace(".", "").replace(":", "_")
-    output_dir = args.output_dir or (
-        Path(config.get("OUTPUT_DIR", "data_samples/KW_PER_DOC_LLM")).parent
-        / f"{Path(config.get('OUTPUT_DIR', 'KW_PER_DOC_LLM')).name}_{model_suffix}"
-    )
+    output_base = Path(config.get("OUTPUT_DIR", "data_samples/KW_PER_DOC_LLM"))
+    output_dir = args.output_dir or (output_base.parent / f"{output_base.name}_{model_suffix}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     include_non_text = config.get("INCLUDE_NON_TEXT", "true").lower() == "true"
@@ -233,6 +231,12 @@ def main(argv: Optional[List[str]] = None) -> None:
         line_chat_fn = make_chat_fn(session, headers, model, line_schema, args.max_retries, args.timeout, provider_block)
         doc_chat_fn = make_chat_fn(session, headers, model, doc_schema, args.max_retries, args.timeout, provider_block)
 
+        def _make_doc_builder(filename: str) -> Callable[[str], Any]:
+            """Per-document user-content builder for run_document_level(); routes
+            the .md/.txt body through _build_attachment_content so --attach-as-file
+            actually takes effect (inlined text when the flag is off)."""
+            return lambda doc_text: _build_attachment_content(doc_text, filename, args.attach_as_file)
+
         if input_path.is_file():
             input_files = [input_path]
         else:
@@ -254,7 +258,13 @@ def main(argv: Optional[List[str]] = None) -> None:
 
             try:
                 if f.suffix.lower() in _DOC_INPUT_EXTENSIONS:
-                    results, stats = run_document_level(f, doc_chat_fn, doc_prompt, DocModel)
+                    results, stats = run_document_level(
+                        f,
+                        doc_chat_fn,
+                        doc_prompt,
+                        DocModel,
+                        user_content_builder=_make_doc_builder(f.name),
+                    )
                 else:
                     results, stats = run_line_level(
                         f,

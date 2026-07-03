@@ -26,7 +26,7 @@ import csv
 import enum
 import json
 from pathlib import Path
-from typing import Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -357,14 +357,13 @@ def build_schema(term_names: List[str]) -> type:
     return ConstrainedEnrichment
 
 
-def build_system_prompt(
-    vocab_data: dict,
-    max_tokens: int,
-    skip_truncation: bool = False,
-) -> Tuple[str, List[str]]:
-    """Same vocabulary-truncation strategy as llm_run.build_system_prompt, but
-    driven by approx_token_count() instead of a tokenizer — no HF/torch
-    dependency, at the cost of an approximate (not exact) token budget."""
+def _collect_vocab_terms(vocab_data: dict) -> List[dict]:
+    """Flatten ``vocab_data`` into a list of ``{theme, cs, en}`` term dicts,
+    with the fixed 'Nerelevantní (meta-text)' administrative term prepended.
+
+    Shared by build_system_prompt() and build_document_system_prompt() —
+    the two callers differ only in header/footer text, not in how
+    vocabulary terms are gathered from the nested theme/keyword structure."""
     raw_terms: List[dict] = [
         {
             "theme": "Administrative / Meta",
@@ -372,7 +371,6 @@ def build_system_prompt(
             "en": "Irrelevant / Meta-text",
         }
     ]
-
     for theme, data in vocab_data.items():
         if theme.lower() == "other":
             continue
@@ -387,67 +385,108 @@ def build_system_prompt(
                 for cs_key, pair in data.items():
                     en = pair.get("en", cs_key) if isinstance(pair, dict) else cs_key
                     raw_terms.append({"theme": theme, "cs": cs_key, "en": en})
+    return raw_terms
 
-    prioritised = raw_terms
 
-    def _build_candidate_prompt(term_list: List[dict], other_cap: int = 15) -> str:
-        themes: Dict[str, List[str]] = {}
-        other_terms: List[dict] = []
+def _render_vocab_prompt(header: str, term_list: List[dict], other_cap: int = 15, footer: str = "") -> str:
+    """Render ``term_list`` under ``header``, grouped by theme, with an
+    'Other (Misc)' tail capped at ``other_cap`` terms, then ``footer``.
 
-        for t in term_list:
-            if t["theme"] == "Other":
-                other_terms.append(t)
-            else:
-                themes.setdefault(t["theme"], []).append(f"{t['cs']} ({t['en']})")
+    The prompt-rendering half shared by build_system_prompt() and
+    build_document_system_prompt() (single-line uses ``_EXAMPLES_FOOTER``,
+    whole-document uses no footer — see their thin wrappers below)."""
+    themes: Dict[str, List[str]] = {}
+    other_terms: List[dict] = []
+    for t in term_list:
+        if t["theme"] == "Other":
+            other_terms.append(t)
+        else:
+            themes.setdefault(t["theme"], []).append(f"{t['cs']} ({t['en']})")
 
-        prompt = _SYSTEM_HEADER
-        for theme_name, lines in themes.items():
-            prompt += f"\n--- {theme_name} ---\n"
-            prompt += "\n".join(f"- {line}" for line in lines) + "\n"
+    prompt = header
+    for theme_name, lines in themes.items():
+        prompt += f"\n--- {theme_name} ---\n"
+        prompt += "\n".join(f"- {line}" for line in lines) + "\n"
+    if other_terms:
+        prompt += "\n--- Other (Misc) ---\n"
+        prompt += "\n".join(f"- {t['cs']} ({t['en']})" for t in other_terms[:other_cap]) + "\n"
+    prompt += footer
+    return prompt
 
-        if other_terms:
-            prompt += "\n--- Other (Misc) ---\n"
-            prompt += "\n".join(f"- {t['cs']} ({t['en']})" for t in other_terms[:other_cap]) + "\n"
 
-        prompt += _EXAMPLES_FOOTER
-        return prompt
+def _fit_vocab_prompt(
+    header: str,
+    raw_terms: List[dict],
+    max_tokens: int,
+    skip_truncation: bool = False,
+    footer: str = "",
+    verbose: bool = False,
+) -> Tuple[str, List[str]]:
+    """Render ``raw_terms`` under ``header``/``footer``, binary-searching for
+    the largest prefix that fits ``max_tokens`` if the full vocabulary
+    doesn't. ``verbose=True`` prints the ``[vocab]``/``[WARN]`` progress
+    lines (matches build_system_prompt()'s prior behaviour); the
+    whole-document prompt renders silently (matches
+    build_document_system_prompt()'s prior behaviour) — callers below
+    preserve each function's original verbosity via this flag."""
 
-    full_prompt = _build_candidate_prompt(prioritised)
+    def _render(term_list: List[dict]) -> str:
+        return _render_vocab_prompt(header, term_list, footer=footer)
+
+    full_prompt = _render(raw_terms)
     token_count = approx_token_count(full_prompt)
 
-    print(f"[vocab] {len(prioritised)} terms, ~{token_count} tokens total (char-based estimate)")
+    if verbose:
+        print(f"[vocab] {len(raw_terms)} terms, ~{token_count} tokens total (char-based estimate)")
 
     if skip_truncation:
-        print(f"[vocab] Injecting full vocabulary (~{token_count} tokens, no truncation).")
-        return full_prompt, [t["cs"] for t in prioritised]
+        if verbose:
+            print(f"[vocab] Injecting full vocabulary (~{token_count} tokens, no truncation).")
+        return full_prompt, [t["cs"] for t in raw_terms]
 
     if token_count <= max_tokens:
-        print("[vocab] Full vocabulary fits within (approximate) token budget.")
-        return full_prompt, [t["cs"] for t in prioritised]
+        if verbose:
+            print("[vocab] Full vocabulary fits within (approximate) token budget.")
+        return full_prompt, [t["cs"] for t in raw_terms]
 
-    print(
-        f"[WARN] Vocabulary (~{token_count} tokens) exceeds budget "
-        f"({max_tokens}). Binary-searching for largest fitting prefix…"
-    )
+    if verbose:
+        print(
+            f"[WARN] Vocabulary (~{token_count} tokens) exceeds budget "
+            f"({max_tokens}). Binary-searching for largest fitting prefix…"
+        )
 
-    lo, hi = 0, len(prioritised)
+    lo, hi = 0, len(raw_terms)
     while lo < hi - 1:
         mid = (lo + hi) // 2
-        candidate = _build_candidate_prompt(prioritised[:mid])
-        if approx_token_count(candidate) <= max_tokens:
+        if approx_token_count(_render(raw_terms[:mid])) <= max_tokens:
             lo = mid
         else:
             hi = mid
 
-    surviving_terms = prioritised[:lo]
-    surviving_prompt = _build_candidate_prompt(surviving_terms)
+    surviving_terms = raw_terms[:lo]
+    surviving_prompt = _render(surviving_terms)
     surviving_cs = [t["cs"] for t in surviving_terms]
 
-    print(
-        f"[vocab] Truncated to {len(surviving_cs)} terms "
-        f"(~{approx_token_count(surviving_prompt)} tokens)."
-    )
+    if verbose:
+        print(
+            f"[vocab] Truncated to {len(surviving_cs)} terms "
+            f"(~{approx_token_count(surviving_prompt)} tokens)."
+        )
     return surviving_prompt, surviving_cs
+
+
+def build_system_prompt(
+    vocab_data: dict,
+    max_tokens: int,
+    skip_truncation: bool = False,
+) -> Tuple[str, List[str]]:
+    """Same vocabulary-truncation strategy as llm_run.build_system_prompt, but
+    driven by approx_token_count() instead of a tokenizer — no HF/torch
+    dependency, at the cost of an approximate (not exact) token budget."""
+    raw_terms = _collect_vocab_terms(vocab_data)
+    return _fit_vocab_prompt(
+        _SYSTEM_HEADER, raw_terms, max_tokens, skip_truncation, footer=_EXAMPLES_FOOTER, verbose=True
+    )
 
 
 _DOC_SYSTEM_HEADER = (
@@ -511,61 +550,8 @@ def build_document_system_prompt(
 ) -> Tuple[str, List[str]]:
     """Same vocabulary-injection/truncation as build_system_prompt(), with the
     whole-document instruction header instead of the single-line one."""
-    raw_terms: List[dict] = [
-        {
-            "theme": "Administrative / Meta",
-            "cs": "Nerelevantní (meta-text)",
-            "en": "Irrelevant / Meta-text",
-        }
-    ]
-    for theme, data in vocab_data.items():
-        if theme.lower() == "other":
-            continue
-        if isinstance(data, dict):
-            if "keywords" in data and isinstance(data["keywords"], dict):
-                cs_list = data["keywords"].get("cs", [])
-                en_list = data["keywords"].get("en", [])
-                for i, cs_key in enumerate(cs_list):
-                    en = en_list[i] if i < len(en_list) else cs_key
-                    raw_terms.append({"theme": theme, "cs": cs_key, "en": en})
-            else:
-                for cs_key, pair in data.items():
-                    en = pair.get("en", cs_key) if isinstance(pair, dict) else cs_key
-                    raw_terms.append({"theme": theme, "cs": cs_key, "en": en})
-
-    def _build_candidate_prompt(term_list: List[dict], other_cap: int = 15) -> str:
-        themes: Dict[str, List[str]] = {}
-        other_terms: List[dict] = []
-        for t in term_list:
-            if t["theme"] == "Other":
-                other_terms.append(t)
-            else:
-                themes.setdefault(t["theme"], []).append(f"{t['cs']} ({t['en']})")
-
-        prompt = _DOC_SYSTEM_HEADER
-        for theme_name, lines in themes.items():
-            prompt += f"\n--- {theme_name} ---\n"
-            prompt += "\n".join(f"- {line}" for line in lines) + "\n"
-        if other_terms:
-            prompt += "\n--- Other (Misc) ---\n"
-            prompt += "\n".join(f"- {t['cs']} ({t['en']})" for t in other_terms[:other_cap]) + "\n"
-        return prompt
-
-    full_prompt = _build_candidate_prompt(raw_terms)
-    token_count = approx_token_count(full_prompt)
-
-    if skip_truncation or token_count <= max_tokens:
-        return full_prompt, [t["cs"] for t in raw_terms]
-
-    lo, hi = 0, len(raw_terms)
-    while lo < hi - 1:
-        mid = (lo + hi) // 2
-        if approx_token_count(_build_candidate_prompt(raw_terms[:mid])) <= max_tokens:
-            lo = mid
-        else:
-            hi = mid
-    surviving_terms = raw_terms[:lo]
-    return _build_candidate_prompt(surviving_terms), [t["cs"] for t in surviving_terms]
+    raw_terms = _collect_vocab_terms(vocab_data)
+    return _fit_vocab_prompt(_DOC_SYSTEM_HEADER, raw_terms, max_tokens, skip_truncation, verbose=False)
 
 
 def run_document_level(
@@ -573,19 +559,28 @@ def run_document_level(
     chat_fn: ChatFn,
     system_prompt: str,
     DocumentEnrichmentModel: type,
+    user_content_builder: Optional[Callable[[str], Any]] = None,
 ) -> Tuple[List[dict], Dict[str, int]]:
     """
     Run whole-document enrichment over a single Markdown/plain-text file
     (typically api_util/xml_to_md.py output). One chat call per document,
     returning every located passage instead of one record per input row.
+
+    ``user_content_builder``, when supplied, is called with the raw document
+    text and its return value becomes the user message's ``content`` as-is
+    (e.g. OpenRouter's file-attachment content-part list) — this is how
+    --attach-as-file actually reaches the wire. When omitted, the document
+    text is inlined as plain message text (``DOCUMENT:\n<text>``), matching
+    every caller's original behaviour.
     """
     file_id = Path(input_path).stem
     stats: Dict[str, int] = {"processed": 0, "skipped_filter": 0, "skipped_error": 0, "aborted": 0}
 
     doc_text = Path(input_path).read_text(encoding="utf-8")
+    user_content: Any = user_content_builder(doc_text) if user_content_builder else f"DOCUMENT:\n{doc_text}"
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"DOCUMENT:\n{doc_text}"},
+        {"role": "user", "content": user_content},
     ]
 
     try:
@@ -624,6 +619,19 @@ def run_document_level(
 # ---------------------------------------------------------------------------
 
 
+def _coerce_int(value: Any, default: int = 0) -> int:
+    """Best-effort int coercion for a row's page_num/line_num field.
+
+    A blank or non-numeric value coerces to `default` instead of raising —
+    the line is still processed. Previously run_line_level treated a
+    ValueError/TypeError here as a filter-skip and silently dropped the row,
+    which mislabelled a data problem as a quality-filter decision."""
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return default
+
+
 def run_line_level(
     input_path: Path,
     chat_fn: ChatFn,
@@ -659,12 +667,8 @@ def run_line_level(
 
     for i, row in enumerate(rows):
         try:
-            try:
-                page_num = int(row.get("page_num", row.get("page", 0)))
-                line_num = int(row.get("line_num", row.get("line", 0)))
-            except (ValueError, TypeError):
-                stats["skipped_filter"] += 1
-                continue
+            page_num = _coerce_int(row.get("page_num", row.get("page", 0)))
+            line_num = _coerce_int(row.get("line_num", row.get("line", 0)))
 
             text_chunk = row.get("text", "").strip()
             categ = row.get("categ", "").strip()

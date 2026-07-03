@@ -57,14 +57,20 @@ def ensure_model_pulled(host: str, model: str, session: requests.Session, timeou
     try:
         resp = session.get(f"{host}/api/tags", timeout=timeout)
         resp.raise_for_status()
-        available = {m.get("name") for m in resp.json().get("models", [])}
+        available = {m.get("name") for m in resp.json().get("models", []) if m.get("name")}
     except requests.RequestException as exc:
         raise RuntimeError(
             f"Could not reach Ollama at {host} — is 'ollama serve' running? ({exc})"
         ) from exc
 
-    # Ollama tags are often 'model:latest' — match on the bare name too.
-    if model in available or any(a.split(":")[0] == model.split(":")[0] for a in available):
+    # A model counts as present only under its EXACT tag. Ollama resolves an
+    # untagged request to ':latest', so treat a bare name (no ':') as satisfied
+    # by '<name>:latest' too — but NOT by a *different* tag of the same family:
+    # requesting 'qwen2.5:7b' must still pull it even when 'qwen2.5:14b' is
+    # already installed.
+    if model in available:
+        return
+    if ":" not in model and f"{model}:latest" in available:
         return
 
     print(f"[ollama] Model '{model}' not found locally — pulling…")
@@ -148,10 +154,8 @@ def main(argv: Optional[List[str]] = None) -> None:
     paradata_dir = config.get("PARADATA_DIR", "paradata")
 
     model_suffix = model.replace(":", "_").replace(".", "").replace("/", "_")
-    output_dir = args.output_dir or (
-        Path(config.get("OUTPUT_DIR", "data_samples/KW_PER_DOC_LLM")).parent
-        / f"{Path(config.get('OUTPUT_DIR', 'KW_PER_DOC_LLM')).name}_{model_suffix}"
-    )
+    output_base = Path(config.get("OUTPUT_DIR", "data_samples/KW_PER_DOC_LLM"))
+    output_dir = args.output_dir or (output_base.parent / f"{output_base.name}_{model_suffix}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     include_non_text = config.get("INCLUDE_NON_TEXT", "true").lower() == "true"
