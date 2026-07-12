@@ -1,20 +1,16 @@
 # .github/workflows/gpu-inference.yml
 # GPU inference integration tests — runs on a self-hosted GPU runner.
 #
-# INFRA-GATED: This job stays queued/inert until a self-hosted runner is
-# registered with the [self-hosted, gpu] labels (ARUP/UFAL infra owner). It
-# never blocks PRs (manual-dispatch + weekly only).
+# INFRA-GATED: This job stays queued/inert until ARUP provides a self-hosted
+# runner registered with the [self-hosted, gpu] labels (@rharasim, owner).
+# It never blocks PRs (manual-dispatch + weekly only).
 #
-# When active it exercises the local transformers/vLLM path (llm_run.py,
+# When active it exercises the optional LLM inference path (llm_run.py,
 # llm_utils.py) which requires requirements_llm.txt (torch, transformers,
-# bitsandbytes, vLLM). The GPU runner must have CUDA drivers installed.
+# bitsandbytes, etc.).  The GPU runner must have CUDA drivers installed.
 #
-# Exit-5 guard: same as scheduled-smoke.yml — tolerated until
-# @pytest.mark.slow GPU tests are written. Until then the job "passes" by
-# collecting no tests.
-#
-# HF_TOKEN: add as a repo/org secret to exercise gated HF models
-# (gemma-4-*, gemma-3-*, llama3.1-70b, llama4-maverick) in the slow suite.
+# HF_TOKEN: add as a repo/org secret if gated HF models (gemma, llama4) are
+# exercised in the slow GPU test suite.
 
 name: GPU Inference Tests
 
@@ -25,7 +21,9 @@ on:
   workflow_dispatch:
 
 env:
-  REQUIREMENTS: "requirements.txt requirements_llm.txt"
+  APT_PACKAGES: ""
+  PRE_INSTALL_TORCH: ""
+  REQUIREMENTS: "requirements.txt requirements-test.txt requirements_llm.txt"
 
 jobs:
   gpu-inference:
@@ -34,30 +32,25 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Show GPU
-        run: nvidia-smi
+        uses: actions/checkout@v7
 
       - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
-      - name: Install base + LLM dependencies
+      - name: Install base + test + LLM dependencies
         run: |
           pip install --upgrade pip
-          for req in ${{ env.REQUIREMENTS }}; do
-            if [ -f "$req" ]; then pip install -r "$req"; fi
-          done
-          pip install pytest
+          pip install -r requirements.txt -r requirements-test.txt -r requirements_llm.txt
 
       - name: Run GPU/slow-marked tests (exit-5 tolerant)
-        # Exit code 5 = "no tests collected" — tolerated until GPU slow tests exist.
-        # HF_TOKEN is injected if set, enabling gated model tests.
+        # Exit code 5 = "no tests collected" — tolerated until GPU slow tests
+        # exist. `|| rc=$?` is required under the runner's `bash -e` shell.
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
-          python -m pytest -m slow -v --tb=short
-          rc=$?
-          [ "$rc" -eq 5 ] && echo "[gpu] No slow tests collected — OK (infra ready)" && exit 0 || exit $rc
+          rc=0
+          python -m pytest -m slow -v --tb=short || rc=$?
+          if [ "$rc" -eq 5 ]; then echo "[gpu] No slow tests collected — OK (infra ready)"; exit 0; fi
+          exit $rc

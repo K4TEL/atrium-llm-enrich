@@ -29,4 +29,8 @@ jobs:
       # llm image a second time under the unsuffixed tag instead of a real
       # lean base image. base has no ENTRYPOINT and is not meant to be run
       # standalone — only remote and llm are publishable targets.
+      # base has no ENTRYPOINT and is not meant to be run standalone — only
+      # remote and llm are publishable targets. (Since the template fix,
+      # targets pass through verbatim, so listing "base" would now build the
+      # real base stage — still pointless here, so it stays excluded.)
       build-targets: '["remote", "llm"]'

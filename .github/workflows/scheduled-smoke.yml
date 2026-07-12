@@ -1,21 +1,20 @@
 # .github/workflows/scheduled-smoke.yml
 # Nightly smoke run against the full test suite (including slow-marked tests).
 #
-# Current state: atrium-llm-enrich has 0 tests marked @pytest.mark.slow (the
-# suite so far covers llm_client_shared.py and api_util/xml_to_md.py, both
-# pure-Python and network/GPU-free), so `pytest -m slow` exits with code 5
-# ("no tests collected"). The run step tolerates exit 5 so the job stays
-# green until slow tests are added.
+# Current state: nlp-enrich has 0 tests marked @pytest.mark.slow, so
+# `pytest -m slow` exits with code 5 ("no tests collected").  The run step
+# tolerates exit 5 so the job stays green until slow tests are added.
 #
-# Follow-up: mark genuine network-integration tests (vocab_manager.py's live
-# AMCR OAI-PMH harvest, a real OpenRouter/Ollama round-trip) @pytest.mark.slow
-# to give this job real validation value.
+# Follow-up: mark the genuine LINDAT/network integration tests @pytest.mark.slow
+# (call_udpipe, call_nametag live calls) to give this job real validation value.
 #
 # PARAM block (mirrors docker.yml build args for consistency):
-#   REQUIREMENTS — base + remote-client deps only (no LLM/GPU stack — that
-#                  lane is gpu-inference.yml on self-hosted runners).
+#   APT_PACKAGES     — no extra apt deps for the base nlp-enrich image
+#   PRE_INSTALL_TORCH — torch is not pre-installed for the CPU-only smoke run
+#   REQUIREMENTS     — base + test requirements (no LLM stack)
 #
 # Infra note: this job runs on GitHub-hosted ubuntu-latest (CPU-only).
+# GPU inference tests live in gpu-inference.yml on self-hosted runners.
 
 name: Scheduled Smoke Tests
 
@@ -26,7 +25,9 @@ on:
   workflow_dispatch:
 
 env:
-  REQUIREMENTS: "requirements.txt requirements_remote.txt"
+  APT_PACKAGES: ""
+  PRE_INSTALL_TORCH: ""
+  REQUIREMENTS: "requirements.txt requirements-test.txt"
 
 jobs:
   smoke:
@@ -35,32 +36,31 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python 3.11
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
 
       - name: Cache pip
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/pip
-          key: pip-smoke-${{ runner.os }}-${{ hashFiles('requirements.txt', 'requirements_remote.txt') }}
+          key: pip-smoke-${{ runner.os }}-${{ hashFiles('requirements.txt', 'requirements-test.txt') }}
           restore-keys: |
             pip-smoke-${{ runner.os }}-
 
       - name: Install dependencies
-        run: |
-          for req in ${{ env.REQUIREMENTS }}; do
-            if [ -f "$req" ]; then pip install -r "$req"; fi
-          done
-          pip install pytest
+        run: pip install -r requirements.txt -r requirements-test.txt
 
       - name: Run slow-marked tests (exit-5 tolerant)
         # Exit code 5 = "no tests collected" — tolerated until @pytest.mark.slow
-        # tests are added. Any other non-zero exit propagates as a genuine failure.
+        # tests are added for LINDAT/network calls.  The `|| rc=$?` capture is
+        # load-bearing: run steps execute under `bash -e`, so a bare
+        # `pytest; rc=$?` aborts before rc is ever read (the old guard was dead).
         run: |
-          python -m pytest -m slow -v --tb=short
-          rc=$?
-          [ "$rc" -eq 5 ] && echo "[smoke] No slow tests collected — OK" && exit 0 || exit $rc
+          rc=0
+          python -m pytest -m slow -v --tb=short || rc=$?
+          if [ "$rc" -eq 5 ]; then echo "[smoke] No slow tests collected — OK"; exit 0; fi
+          exit $rc
