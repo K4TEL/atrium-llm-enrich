@@ -141,7 +141,7 @@ def score_corpus(pages: List[Dict[str, float]], tiers: List[str]) -> Dict[str, D
     if len(pages) != len(tiers):
         raise ValueError("pages and tiers must be parallel lists of equal length")
     buckets: Dict[str, List[Dict[str, float]]] = {}
-    for page, tier in zip(pages, tiers):
+    for page, tier in zip(pages, tiers, strict=False):
         buckets.setdefault(tier, []).append(page)
         buckets.setdefault("overall", []).append(page)
 
