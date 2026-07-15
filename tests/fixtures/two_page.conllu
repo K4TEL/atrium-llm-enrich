@@ -1,0 +1,20 @@
+# newdoc
+# sent_id = 1
+# text = První věta stránky jedna.
+1	První	první	ADJ	_	_	2	amod	_	_
+2	věta	věta	NOUN	_	_	0	root	_	_
+
+# sent_id = 2
+# text = Druhá věta stránky jedna.
+1	Druhá	druhý	ADJ	_	_	2	amod	_	_
+2	věta	věta	NOUN	_	_	0	root	_	_
+
+# sent_id = 1
+# text = První věta stránky dvě.
+1	První	první	ADJ	_	_	2	amod	_	_
+2	věta	věta	NOUN	_	_	0	root	_	_
+
+# sent_id = 2
+# text = Druhá věta stránky dvě.
+1	Druhá	druhý	ADJ	_	_	2	amod	_	_
+2	věta	věta	NOUN	_	_	0	root	_	_
