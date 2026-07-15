@@ -128,6 +128,16 @@ def test_score_corpus_length_mismatch_raises():
 
 
 # ── teds_score optional dependency ──────────────────────────────────────────
-def test_teds_score_without_optional_dep_raises_importerror():
-    with pytest.raises(ImportError):
-        teds_score("<table></table>", "<table></table>")
+def test_teds_score_optional_dependency_guard():
+    """Without the vendored table_teds scorer, teds_score must raise a guided
+    ImportError (not crash elsewhere). Once table_teds.py is vendored
+    (hub issue #22, Milestone 2 table track), this guard path no longer applies
+    — skip then, and add real TEDS scoring tests alongside the vendored module.
+    """
+    try:
+        import table_teds  # noqa: F401
+    except ImportError:
+        with pytest.raises(ImportError):
+            teds_score("<table></table>", "<table></table>")
+    else:
+        pytest.skip("table_teds is vendored — guard path not applicable; add real TEDS tests")
