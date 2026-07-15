@@ -14,6 +14,7 @@ identical across all repositories; anything repo-specific is called out explicit
 
 | Version    | Highlights                                                                                                                                                     | Status      |
 |:-----------|:---------------------------------------------------------------------------------------------------------------------------------------------------------------|:------------|
+| **v0.2.0** | Added new files according to plan. Added new GHA files. Added Document Understanding draft scripts. Added new tests. Fixed according to Fable review.          | Pre-release |
 | **v0.1.0** | Initial repo: LLM engine copied from `atrium-nlp-enrich`, NameTag/UDPipe dropped, `openrouter_client.py` + `ollama_client.py` + `api_util/xml_to_md.py` added. | Pre-release |
 
 **Versioning rules (enforced by CI):** the `[tool] version` in `para_config.txt`, `version:` in
