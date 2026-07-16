@@ -42,6 +42,7 @@ a confidence score.
 - [Document-Level Input (`api_util/xml_to_md.py`)](#document-level-input-api_utilxml_to_mdpy)
 - [🖥 Model Registry](#-model-registry)
 - [📁 Inputs and Outputs](#-inputs-and-outputs)
+- [📐 Document Understanding benchmark (`sample_stratify.py` + `bench_compare.py`)](#-document-understanding-benchmark-sample_stratifypy--bench_comparepy)
 - [🐳 Docker](#-docker)
 - [Paradata Logs](#paradata-logs)
 - [Acknowledgements](#acknowledgements-)
@@ -324,6 +325,82 @@ CPU RAM — see the config file's worked examples for `qwen3-235b-a22b-fp8` on 4
   "errors_before_abort": 10,
   "timestamp_utc": "2026-05-20T09:14:33"
 }
+```
+
+## 📐 Document Understanding benchmark (`sample_stratify.py` + `bench_compare.py`)
+
+The head-to-head evaluation harness decided in hub issue
+[#22](https://github.com/ufal/atrium-project/issues/22): out-of-the-box VLM/OCR models vs. the
+legacy ABBYY/ALTO pipeline, scored per quality tier on an in-domain gold set. Three pieces, all
+torch-free (`eval_metrics.py` is pure stdlib):
+
+**1. Sample pages, stratified by OCR quality** — consumes the per-page stats produced by
+`atrium-alto-postprocess` (`samples_page_stats.csv`, or a `DOC_LINE_CATEG/` directory aggregated
+on the fly), buckets pages into difficulty tiers (`clean` / `degraded` / `hard` / `text_poor`),
+and writes an annotation manifest with a deterministic 80/10/10 train/dev/test split:
+
+```bash
+python sample_stratify.py --page-stats samples_page_stats.csv --n 200 --output docu_sample_manifest.csv
+python sample_stratify.py --lines-dir ../atrium-alto-postprocess/data_samples/DOC_LINE_CATEG --n 40
+```
+
+**2. Annotate gold transcriptions** — the gold directory mirrors the
+`atrium-alto-postprocess` `PAGE_TXT*` layout, one UTF-8 plain-text file per manifest page in
+reading order (whitespace is normalized before scoring, so line breaks are free):
+
+```
+gold/
+└── CTX192100040/
+    ├── CTX192100040-1.txt              # required: full-page transcription
+    └── CTX192100040-1.entities.tsv     # optional: TYPE<TAB>surface text (CNEC 2.0 / TEATER)
+```
+
+Entity sidecars are scored only with `--entities`; a page joins the entity aggregates only when
+the *gold* sidecar exists (a missing hypothesis sidecar counts as zero predicted entities).
+Table scoring (TEDS) is deferred until `table_teds.py` is vendored.
+
+**3. Run the comparison** — each named `--pred` directory is one "model"; the `PAGE_TXT*`
+outputs of `atrium-alto-postprocess` (alto-tools / LayoutReader / GLM-4v) can be consumed
+directly, alongside any VLM transcriptions written in the same layout:
+
+```bash
+python bench_compare.py --manifest docu_sample_manifest.csv \
+    --gold data/gold \
+    --pred alto=../atrium-alto-postprocess/data_samples/PAGE_TXT \
+           layoutreader=../atrium-alto-postprocess/data_samples/PAGE_TXT_LR \
+           glm=../atrium-alto-postprocess/data_samples/PAGE_TXT_LLM \
+    --split test --output-dir bench_results
+```
+
+Outputs in `--output-dir` (deterministic, byte-identical across reruns):
+
+| File                   | Content                                                                                                                                                                               |
+|------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `page_scores.csv`      | long format — one row per model × page: CER, WER, NED, char counts, optional entity P/R/F1                                                                                            |
+| `aggregate_scores.csv` | per model × tier (+ `overall`): macro CER/WER/NED, micro-pooled entity P/R/F1, page/missing counts                                                                                    |
+| `report.md`            | model-comparison tables (overall + per-tier), best values bolded — the DU analogue of the [page-classification](https://github.com/ufal/atrium-page-classification) comparison tables |
+
+
+| Model            | Pages | CER (%)  | WER (%)  | NED       |
+|------------------|-------|----------|----------|-----------|
+| **layoutreader** | 7     | **0.00** | **0.00** | **0.000** |
+| mock-vlm         | 6     | 1.41     | 8.36     | 0.014     |
+
+
+Missing prediction files are skipped and counted per model (`--missing error` to fail instead);
+missing gold files exclude the page for all models. Every run drops a paradata JSON
+(see [Paradata Logs](#paradata-logs)). Both scripts also read an optional shared INI config
+(`--config config_docu.txt`) with `[STRATIFY]` and `[BENCHMARK]` sections:
+
+```ini
+[BENCHMARK]
+MANIFEST = docu_sample_manifest.csv
+GOLD_DIR = data/gold
+PRED_DIRS = alto=../alto/PAGE_TXT, layoutreader=../alto/PAGE_TXT_LR
+SPLIT = test
+ENTITIES = false
+MISSING = skip
+OUTPUT_DIR = bench_results
 ```
 
 ## 🐳 Docker
