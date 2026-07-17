@@ -106,17 +106,40 @@ MIN_ALPHA_RATIO_NON_TEXT=0.4
 # you need a different value than the model default of 16 384.
 # MAX_MODEL_LEN=16384
 
-# GB of model weights to keep in CPU RAM when GPU VRAM is insufficient.
+# GB of model weights to keep in CPU RAM when GPU VRAM is insufficient
+# (vLLM UVA zero-copy — the GPU stays the sole compute engine and no CPU
+# cores are consumed; offloaded weights cross PCIe on every forward pass,
+# expect a 3–6× throughput penalty).
+#
+# CPU_OFFLOAD_GB=auto sizes the offload at engine load: it measures the
+# model's weight footprint (local HF cache → HF Hub → registry estimate),
+# subtracts the GPU weight budget (VRAM × GPU_MEMORY_UTILIZATION − 4 GB/GPU
+# KV reserve, × TENSOR_PARALLEL_SIZE), caps the result against available CPU
+# RAM, and prints the decision plus the SLURM --mem the job needs. The large
+# registry models (qwen3-235b-*, llama4-maverick, deepseek-v3) already
+# default to auto — it resolves to 0 wherever the weights fit.
+#
+# SLURM sizing when offloading: drop the big-VRAM node constraint (e.g.
+# --constraint="gpuram48G|gpuram40G") so the job can schedule on any GPU
+# node, and raise --mem so system RAM holds the offloaded weights:
+# --mem ≥ offload + ~40G (the startup log prints the exact number).
+#
 # Useful configurations (requires vLLM ≥ 0.8.x for Qwen3 MoE):
 #
 #   qwen3-235b-a22b-fp8  on 4× L40 48 GB (dll-4gpu3, CC 8.9 — hardware FP8!):
 #     TENSOR_PARALLEL_SIZE=4
 #     CPU_OFFLOAD_GB=70     ← moves ~70 GB of weights to CPU; 503 GB CPU RAM available
+#                             (CPU_OFFLOAD_GB=auto computes ~85 GB — safer, more KV room)
 #
 #   qwen3-235b-a22b-fp8  on 8× A100 40 GB (tdll-8gpu, CC 8.0 — BF16 fallback):
 #     TENSOR_PARALLEL_SIZE=8
 #     CPU_OFFLOAD_GB=0      ← 235 GB weights fit in 320 GB without offload
 #
+#   llama3.1-70b (BF16) on a single 48 GB card:
+#     BACKEND=vllm
+#     CPU_OFFLOAD_GB=auto   ← ~105 GB of weights spill to CPU RAM (--mem ≥ 145G)
+#
+# CPU_OFFLOAD_GB=auto
 # CPU_OFFLOAD_GB=0
 
 # Guided-decoding engine (vLLM only): xgrammar (default, fastest) | outlines

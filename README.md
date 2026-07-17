@@ -270,8 +270,44 @@ FP8/BF16 for `vllm`.
 > primary throughput multiplier, and it also removes the need to truncate the vocabulary to fit
 > the token budget.
 
+### Running models larger than VRAM (CPU offload)
+
 `CPU_OFFLOAD_GB` (vLLM ≥ 0.8.x, UVA zero-copy) lets weights that don't fit in GPU VRAM spill to
-CPU RAM — see the config file's worked examples for `qwen3-235b-a22b-fp8` on 4×L40 vs. 8×A100.
+CPU RAM. The GPU stays the sole compute engine — offloaded weights are read through a unified
+address space, so **no CPU cores are consumed**; they stay free for the rest of the pipeline.
+This is *virtual*, not free, VRAM: every offloaded GB crosses the PCIe bus on each forward pass,
+so expect a **3–6× throughput penalty** (fine for overnight batch runs). Quantization
+(FP8 / AWQ / GGUF) remains the primary strategy; offload is what lets a job run on a
+smaller-VRAM node at all.
+
+**`CPU_OFFLOAD_GB=auto`** sizes the spill at engine start:
+
+1. Measures the weight footprint — local HF cache first (exact for the quantization actually
+   downloaded), then the HF Hub API, then the registry's `weight_footprint_gb` estimate.
+2. Computes the deficit against the GPU weight budget:
+   `(VRAM × GPU_MEMORY_UTILIZATION − 4 GB/GPU KV reserve) × TENSOR_PARALLEL_SIZE`, +2 GB margin.
+3. Caps the result against available CPU RAM (24 GB held back for the pipeline/OS) and fails
+   fast — printing the required SLURM `--mem` — when even offload cannot fit the model.
+
+The large registry models (`qwen3-235b-a22b`, `qwen3-235b-a22b-fp8`, `llama4-maverick`,
+`deepseek-v3`) default to `auto`; it resolves to 0 wherever the weights fit, so behaviour only
+changes where the run would previously OOM. Explicit integer values still work and are
+sanity-checked at load — an insufficient setting logs a warning with the suggested value.
+
+Worked recipes (UFAL cluster):
+
+| Scenario                                                        | Config                                       | Result                                    |
+|-----------------------------------------------------------------|----------------------------------------------|-------------------------------------------|
+| `qwen3-235b-a22b-fp8` on 4× L40 48 GB (`dll-4gpu3`, 503 GB RAM) | `TENSOR_PARALLEL_SIZE=4` `CPU_OFFLOAD_GB=auto` | ~85 GB spill; hardware FP8 (CC 8.9)       |
+| `qwen3-235b-a22b-fp8` on 8× A100 40 GB (`tdll-8gpu`)            | `TENSOR_PARALLEL_SIZE=8`                     | fits — `auto` resolves to 0               |
+| `llama3.1-70b` (BF16) on one 48 GB card                         | `BACKEND=vllm` `CPU_OFFLOAD_GB=auto`         | ~105 GB spill to CPU RAM (`--mem ≥ 145G`) |
+
+SLURM sizing: when offloading, drop the big-VRAM constraint (e.g.
+`--constraint="gpuram48G|gpuram40G"`) so the job can schedule on any GPU node, and raise `--mem`
+so system RAM holds the offloaded weights — rule of thumb `--mem ≥ offload + ~40G` (the startup
+log prints the exact number). CPU offload composes with tensor parallelism: TP consumes all local
+VRAM first, offload tops up the remainder — the 235 B+ models need both. The transformers backend
+has no offload path; for over-VRAM models the supported answer is `BACKEND=vllm`.
 
 ## 📁 Inputs and Outputs
 
