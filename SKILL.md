@@ -37,7 +37,7 @@ calls directly.
 |--------------|----------------------------------|--------------------------------------------|
 | `openrouter` | remote LLM-as-a-service          | `OPENROUTER_API_KEY`, `OPENROUTER_MODEL`   |
 | `ollama`     | local Ollama server              | `OLLAMA_HOST` reachable, `OLLAMA_MODEL`    |
-| `local`      | in-process transformers/vLLM     | **CLI-only** (`llm_run.py`); API answers 501 |
+| `local`      | in-process transformers/vLLM     | **CLI-only on the development branch**; API answers 501 |
 
 Per line the LLM must pick the single most relevant **TEATER/AMCR category**
 from the controlled vocabulary (it cannot invent categories), extract Czech
@@ -88,8 +88,8 @@ line keywords_cs, keywords_en, category, confidence, text.
 ## Agent Guidelines 🤖
 
 1. Backend selection: omit --backend to use the server default. Choose
-ollama only when a local Ollama server is running; local is CLI-only
-(the API answers 501 - fall back to llm_run.py or another backend).
+ollama only when a local Ollama server is running; local is CLI-only on the
+development branch (the API answers 501 - use another backend here).
 2. Confidence discipline: treat confidence < 0.7 as tentative - surface
 the category with its score rather than asserting it; downstream filters
 commonly threshold on this field.

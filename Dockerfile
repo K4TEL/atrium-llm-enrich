@@ -70,20 +70,5 @@ EXPOSE 8000
 ENTRYPOINT ["uvicorn", "service.api:app", "--host", "0.0.0.0", "--port", "8000"]
 CMD []
 
-
-# ---------------------------------------------------------------------------
-# Local multi-GPU variant — published as :<version>-llm
-# ---------------------------------------------------------------------------
-FROM base AS llm
-
-USER root
-COPY requirements_llm.txt ./
-RUN pip install \
-        --extra-index-url https://download.pytorch.org/whl/cpu \
-        -r requirements_llm.txt
-
-RUN chown -R atrium:atrium /app
-USER atrium
-
-ENTRYPOINT ["python", "llm_run.py"]
-CMD ["llm_config.txt"]
+# The local multi-GPU (transformers/vLLM) image lives on the development branch;
+# this agent-skill branch is torch-free and serves the API only.

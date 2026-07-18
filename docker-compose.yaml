@@ -46,26 +46,5 @@ services:
     ports:
       - "8000:8000"
 
-  llm-enrich-llm:
-    profiles: [llm]
-    image: ghcr.io/ufal/atrium-llm-enrich:${ATRIUM_VERSION:-dev}-llm
-    build:
-      context: .
-      target: llm
-      args:
-        ATRIUM_RUNNER_IMAGE: ghcr.io/ufal/atrium-llm-enrich:${ATRIUM_VERSION:-dev}-llm
-        ATRIUM_RUNNER_REPO: https://github.com/ufal/atrium-llm-enrich
-        ATRIUM_RUNNER_REF: ${ATRIUM_RUNNER_REF:-dev}
-    environment:
-      ATRIUM_RUNNER_IMAGE: ghcr.io/ufal/atrium-llm-enrich:${ATRIUM_VERSION:-dev}-llm
-      ATRIUM_RUNNER_REPO: https://github.com/ufal/atrium-llm-enrich
-      ATRIUM_RUNNER_REF: ${ATRIUM_RUNNER_REF:-dev}
-      HF_HOME: /cache/huggingface
-      HF_TOKEN: ${HF_TOKEN:-}
-    volumes:
-      - ./data:/data
-      - hf-cache:/cache/huggingface
-      - ./llm_config.txt:/app/llm_config.txt:ro
-
-volumes:
-  hf-cache:
+# The local multi-GPU (transformers/vLLM) `llm` image + profile live on the
+# development branch; this agent-skill branch is torch-free and API-only.

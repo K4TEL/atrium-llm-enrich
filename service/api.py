@@ -4,7 +4,7 @@ service/api.py — FastAPI surface for the llm-enrich keyword extraction.
 Mirrors the atrium-nlp-enrich service layout: a thin HTTP wrapper over the
 existing remote/local-lightweight LLM clients, dispatched through
 llm_client_shared.py. The torch stack is deliberately NOT imported here —
-`backend=local` (transformers/vLLM via llm_run.py) stays CLI-only for now and
+`backend=local` (transformers/vLLM) is CLI-only on the development branch and
 the API answers 501 for it, keeping this service installable from
 requirements_remote.txt alone (the repo's established constraint).
 """
@@ -139,8 +139,8 @@ def _get_chat_fn(backend: str):
     elif backend == "local":
         raise HTTPException(
             501,
-            "backend=local (transformers/vLLM) is CLI-only in this release — run llm_run.py, "
-            "or use backend=openrouter / backend=ollama via the API.",
+            "backend=local (transformers/vLLM) is CLI-only on the development branch — "
+            "use backend=openrouter / backend=ollama via the API.",
         )
     else:
         raise HTTPException(422, f"backend must be one of {_ALLOWED_BACKENDS}")
@@ -205,7 +205,7 @@ async def info() -> Dict[str, Any]:
                 "host": _ollama_host(),
                 "model": os.environ.get("OLLAMA_MODEL") or _config.get("OLLAMA_MODEL"),
             },
-            "local": "cli-only (llm_run.py; API answers 501)",
+            "local": "cli-only on the development branch (API answers 501)",
         },
         "vocabulary": {
             "source": "TEATER/AMCR",

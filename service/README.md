@@ -5,8 +5,8 @@ lines, get back **vocabulary-guided archaeological keywords** (Czech + English)
 with a TEATER/AMCR thematic category and a confidence score per line. The
 service wraps the existing remote/lightweight LLM clients
 (`openrouter_client.py`, `ollama_client.py`) through `llm_client_shared.py`;
-the torch stack is **not** imported (`backend=local` stays CLI-only via
-`llm_run.py` and answers HTTP 501). The service version is read from
+the torch stack is **not** imported (`backend=local` is CLI-only on the
+development branch and answers HTTP 501 here). The service version is read from
 `para_config.txt` `[tool]` (single source of truth, never hard-coded).
 
 ## Quick start

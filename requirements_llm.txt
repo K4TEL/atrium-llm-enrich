@@ -1,8 +1,0 @@
-# requirements_llm.txt — multi-GPU inference stack (transformers + vLLM backends)
-bitsandbytes==0.49.2
-pydantic==2.13.4
-requests
-torch==2.7.0
-tqdm
-transformers>=4.57.6
-vllm>=0.9.0
