@@ -5,6 +5,10 @@ requests
 pandas
 pydantic
 tqdm
+# API-service contract tests (tests/test_service_api.py):
+fastapi
+httpx
+python-multipart
 # Optional heavy deps only if the suite truly needs them:
 # torch
 # transformers

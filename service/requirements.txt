@@ -1,0 +1,5 @@
+# service/requirements.txt — API-layer deps on top of requirements_remote.txt.
+# The API deliberately reuses the torch-free remote stack (pydantic, requests).
+fastapi
+uvicorn
+python-multipart
