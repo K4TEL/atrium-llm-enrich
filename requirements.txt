@@ -1,5 +1,14 @@
-# requirements.txt — backend-agnostic base deps (all BACKEND modes need these)
-pydantic
+pytest>=9.1.1
+pytest-cov
 requests
-tqdm
+# Fast-lane runtime deps (clean-venv collection breaks without these):
 pandas
+pydantic
+tqdm
+# API-service contract tests (tests/test_service_api.py):
+fastapi
+httpx
+python-multipart
+# Optional heavy deps only if the suite truly needs them:
+# torch
+# transformers
