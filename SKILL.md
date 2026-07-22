@@ -54,7 +54,7 @@ bash scripts/server.sh          # Docker Compose api profile (or local fallback)
 bash scripts/server.sh --local  # force local uvicorn (no Docker)
 ```
 
-dempotent: exits immediately if GET /info already answers; waits for
+Idempotent: exits immediately if GET /info already answers; waits for
 first-run vocabulary sync.
 
 ### 2. Extract keywords
