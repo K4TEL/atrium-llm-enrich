@@ -22,6 +22,7 @@ imported lazily so the base install never requires it — mirroring
 from __future__ import annotations
 
 import argparse
+import logging
 import re
 import statistics
 import sys
@@ -29,6 +30,8 @@ import unicodedata
 from collections import Counter
 from pathlib import Path
 from typing import List, Optional
+
+logger = logging.getLogger(__name__)
 
 _repo_root = str(Path(__file__).resolve().parent.parent)
 if _repo_root not in sys.path:
@@ -209,12 +212,13 @@ def _render_page(page, page_num: int) -> List[str]:
             if rendered:
                 table_items.append((table.bbox[1], rendered, list(table.bbox)))
                 table_bboxes.append(table.bbox)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Table detection failed on page %d; tables skipped: %s", page_num, exc)
 
     try:
         lines = page.extract_text_lines(strip=True)
-    except Exception:
+    except Exception as exc:
+        logger.warning("Text-line extraction failed on page %d; page will be empty: %s", page_num, exc)
         lines = []
     lines = [ln for ln in lines if not _in_any_table(ln, table_bboxes)]
 

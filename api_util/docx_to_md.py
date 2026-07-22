@@ -18,9 +18,12 @@ resolve against real anchors.
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 from typing import List, Optional
+
+logger = logging.getLogger(__name__)
 
 _repo_root = str(Path(__file__).resolve().parent.parent)
 if _repo_root not in sys.path:
@@ -189,8 +192,8 @@ def _run_image_md(run) -> Optional[str]:
             part = run.part.related_parts.get(rid)
             if part is not None:
                 src = str(part.partname).lstrip("/")
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Could not resolve inline-image alt/src from DOCX run: %s", exc)
     return L.image(alt, src)
 
 
@@ -213,7 +216,8 @@ def _collect_footnotes(document) -> dict:
                 if text:
                     notes[fid] = text
             break
-    except Exception:
+    except Exception as exc:
+        logger.warning("Could not read footnotes part; footnote refs will be unresolved: %s", exc)
         return {}
     return notes
 
