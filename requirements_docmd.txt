@@ -1,0 +1,8 @@
+# requirements_docmd.txt — optional deps for the visually-rich document front-end
+# (api_util/docx_to_md.py, api_util/pdf_to_md.py, api_util/doc_to_visual_md.py).
+#
+# Kept out of the base install: only users converting PDF/DOCX inputs to
+# visually-rich Markdown need these. Both are permissive (MIT), matching the
+# license pressure noted in para_config.txt.
+python-docx   # DOCX reader (MIT) — styles, fonts, tables, headers/footers
+pdfplumber    # digital-born PDF reader (MIT) — word/char bboxes, fonts, tables
