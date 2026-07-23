@@ -40,8 +40,9 @@ def test_convert_routes_docx(monkeypatch, tmp_path):
 def test_convert_routes_pdf(monkeypatch, tmp_path):
     called = {}
 
-    def fake_pdf(path):
+    def fake_pdf(path, ocr=False):
         called["pdf"] = str(path)
+        called["ocr"] = ocr
         return "# pdf md\n"
 
     monkeypatch.setattr(doc_to_visual_md.pdf_to_md, "convert", fake_pdf)
