@@ -69,3 +69,21 @@ USER atrium
 
 ENTRYPOINT ["python", "llm_run.py"]
 CMD ["llm_config.txt"]
+
+
+# ---------------------------------------------------------------------------
+# API service variant — published as :<version>-api
+# FastAPI meta-contract service (strategy §4) wrapping the torch-free remote /
+# lightweight-local enrichment engine. Built on the remote stack + web server.
+# ---------------------------------------------------------------------------
+FROM remote AS api
+
+USER root
+COPY service/requirements.txt ./service/requirements.txt
+RUN pip install -r service/requirements.txt
+RUN chown -R atrium:atrium /app
+USER atrium
+
+EXPOSE 8000
+ENTRYPOINT ["uvicorn", "service.api:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD []

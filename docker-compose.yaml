@@ -45,5 +45,28 @@ services:
       - hf-cache:/cache/huggingface
       - ./llm_config.txt:/app/llm_config.txt:ro
 
+  # FastAPI meta-contract service (strategy §4), port 8000. Wraps the torch-free
+  # remote/lightweight engine — set LLM_BACKEND + the backend's key/model to enable
+  # extraction; /info and /health stay up (ready:false) until then.
+  llm-enrich-api:
+    profiles: [api]
+    image: ghcr.io/ufal/atrium-llm-enrich:${ATRIUM_VERSION:-dev}-api
+    build:
+      context: .
+      target: api
+    environment:
+      LLM_BACKEND: ${LLM_BACKEND:-openrouter}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-}
+      OLLAMA_HOST: ${OLLAMA_HOST:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-10}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/data
+      - ./llm_config.txt:/app/llm_config.txt:ro
+
 volumes:
   hf-cache:

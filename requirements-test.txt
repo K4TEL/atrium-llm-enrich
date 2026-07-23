@@ -5,6 +5,12 @@ requests
 pandas
 pydantic
 tqdm
+# API meta-contract test deps (issue #32) — the service imports torch-free, so
+# its contract test runs in the fast lane.
+fastapi
+httpx
+python-multipart
+openapi-spec-validator
 # Optional heavy deps only if the suite truly needs them:
 # torch
 # transformers
