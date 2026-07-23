@@ -40,6 +40,7 @@ a confidence score.
 - [Remote Inference — OpenRouter (`openrouter_client.py`)](#remote-inference--openrouter-openrouter_clientpy)
 - [Lightweight Local — Ollama (`ollama_client.py`)](#lightweight-local--ollama-ollama_clientpy)
 - [Document-Level Input (`api_util/xml_to_md.py`)](#document-level-input-api_utilxml_to_mdpy)
+- [Visually-Rich Document Input (`api_util/doc_to_visual_md.py`)](#visually-rich-document-input-api_utildoc_to_visual_mdpy)
 - [🖥 Model Registry](#-model-registry)
 - [📁 Inputs and Outputs](#-inputs-and-outputs)
 - [📐 Document Understanding benchmark (`sample_stratify.py` + `bench_compare.py`)](#-document-understanding-benchmark-sample_stratifypy--bench_comparepy)
@@ -66,6 +67,14 @@ pip install -r requirements_remote.txt
 *(Optional) For non-ALTO/non-TEITOK text input (txt/pdf/docx/html/md) via `flexiconv`:*
 ```bash
 pip install -r requirements_flexiconv.txt
+```
+*(Optional) For visually-rich Markdown from DOCX / PDF inputs
+([`api_util/doc_to_visual_md.py`](api_util/doc_to_visual_md.py), see
+[below](#visually-rich-document-input-api_utildoc_to_visual_mdpy)):*
+```bash
+pip install -r requirements_docmd.txt        # python-docx + pdfplumber (MIT)
+# Optional OCR path for scanned / curve-only PDFs additionally needs the system Tesseract binary:
+#   apt-get install tesseract-ocr tesseract-ocr-ces
 ```
 4. Review and update [`llm_config.txt`](llm_config.txt) 📎 — the only required change is
    `MODEL_KEY` (local backends) or `OPENROUTER_MODEL`/`OLLAMA_MODEL` (remote/lightweight-local).
@@ -192,11 +201,16 @@ Two input modes, dispatched by file extension:
 |------------------------|----------------|-------------------|
 | `.csv`, `*.teitok.xml` | Line-level     | qualifying line   |
 | `.md`, `.txt`          | Whole-document | document          |
+| `.pdf`, `.docx`        | Whole-document | document (auto-converted to visually-rich `.md` first) |
 
-`.md`/`.txt` input (typically rendered by [`api_util/xml_to_md.py`](api_util/xml_to_md.py) 📎 —
-see [below](#document-level-input-api_utilxml_to_mdpy)) can optionally be sent as a file
-attachment with `--attach-as-file` rather than inlined as message text; support for this varies
-by model/provider and falls back silently to inlined text where unsupported.
+`.pdf`/`.docx` files in `INPUT_DIR` are **auto-converted** to visually-rich Markdown on the fly
+(via [`api_util/doc_to_visual_md.py`](api_util/doc_to_visual_md.py) 📎 — cached under a
+`_visual_md_cache/` subdir) and then processed document-level; add `--ocr` to transcribe scanned
+pages. `.md`/`.txt` input (rendered by [`api_util/xml_to_md.py`](api_util/xml_to_md.py) 📎 from
+TEITOK/ALTO, or by the converter above — see [below](#visually-rich-document-input-api_utildoc_to_visual_mdpy))
+can optionally be sent as a file attachment with `--attach-as-file` rather than inlined as message
+text; support for this varies by model/provider and falls back silently to inlined text where
+unsupported.
 
 ## Lightweight Local — Ollama (`ollama_client.py`)
 
@@ -228,7 +242,50 @@ python3 api_util/xml_to_md.py sample.teitok.xml --format markdown --output sampl
 
 Output is page-sectioned (`## Page N` headings) so the whole-document system prompt's locator
 instructions ("prefer including the nearest page heading above the located passage") resolve
-against real anchors in the rendered text.
+against real anchors in the rendered text. Pass `--format layout` to additionally emit the
+visual-layout cues below (page dimensions, per-line bounding boxes, page breaks, figures) from the
+TEITOK/ALTO coordinates — the same annotated-Markdown schema the PDF/DOCX converter produces.
+
+## Visually-Rich Document Input (`api_util/doc_to_visual_md.py`)
+
+Converts **DOCX** and **PDF** inputs into the same page-sectioned Markdown, additionally recording
+as many **visual-layout cues** as the source exposes — page borders, canvas size, block bounding
+boxes, fonts, colours/highlights, alignment, tables, headers/footers — as **HTML comments**
+(issue [#10](https://github.com/ufal/atrium-llm-enrich/issues/10)). The cues are invisible to a
+Markdown renderer, plain text to the LLM, and token-cheap; the full taxonomy lives in
+[`api_util/layout_md.py`](api_util/layout_md.py) 📎 (`CUE_SCHEMA`). This makes annotated Markdown the
+single LLM input format across every source — PDF, DOCX, and TEITOK/ALTO (via `xml_to_md.py
+--format layout`) — with PAGE/ALTO/TEITOK kept as the spatial source of truth
+(issue [#11](https://github.com/ufal/atrium-llm-enrich/issues/11)).
+
+```bash
+pip install -r requirements_docmd.txt        # python-docx + pdfplumber (MIT)
+
+# Standalone pre-convert — or just drop the .pdf/.docx into INPUT_DIR and let the client auto-convert.
+python3 api_util/doc_to_visual_md.py report.docx --output INPUT_DIR/report.md
+python3 api_util/doc_to_visual_md.py report.pdf  --output INPUT_DIR/report.md --ocr
+```
+
+A snippet of the output:
+
+```markdown
+## Page 1
+
+<!-- DOC_META: size=612x792pt, orientation=portrait -->
+<!-- BBOX: [72, 58, 196, 76] --> <!-- FONT: size=18pt, family="Times" -->
+Výzkum lokality
+<!-- PAGE_BREAK: pg_2 -->
+```
+
+- **PDF classes.** Digital-born pages are extracted directly (with a decode-sanity check that
+  catches subset fonts decoding Czech diacritics wrongly). Scanned / curve-only pages have no
+  trustworthy text layer: by default they are flagged `<!-- NEEDS_OCR: pg_N (…) -->`; with `--ocr`
+  they are rendered and transcribed with **Tesseract `ces`** (permissive, zero-GPU), tagged
+  `<!-- OCR: engine=tesseract, lang=ces -->`. The OCR requires the system Tesseract binary and
+  `pytesseract` (see Setup); without them the pages simply stay flagged.
+- **Page-level citations.** The document-level schema returns a `page` field per extracted passage,
+  read from the nearest `<!-- PAGE_BREAK: pg_N -->` / `## Page N` marker — enabling
+  `[Source: <doc_id>, Page N]`-style provenance.
 
 ## 🖥 Model Registry
 
@@ -314,8 +371,9 @@ has no offload path; for over-VRAM models the supported answer is `BACKEND=vllm`
 * **Input (local & remote/lightweight-local, line-level):** `INPUT_DIR/*.csv` or
   `*.teitok.xml` — expects `file_id`/`page_num`/`line_num`/`categ`/`quality_score`/`text` columns
   (CSV) or TEITOK's native `pb`/`lb`/`s` structure.
-* **Input (remote/lightweight-local, document-level):** `.md`/`.txt`, typically from
-  [`api_util/xml_to_md.py`](api_util/xml_to_md.py) 📎.
+* **Input (remote/lightweight-local, document-level):** `.md`/`.txt` (from
+  [`api_util/xml_to_md.py`](api_util/xml_to_md.py) 📎), or `.pdf`/`.docx` auto-converted to
+  visually-rich Markdown by [`api_util/doc_to_visual_md.py`](api_util/doc_to_visual_md.py) 📎.
 * **Output:** `<OUTPUT_DIR>_<model_suffix>/*_enriched.json` — one file per document.
 * **Abort sidecar:** `*_enriched.abort.json`, written only when a document is abandoned after 10
   consecutive inference errors — the canonical signal that the JSON output holds partial results.
