@@ -5,4 +5,9 @@
 # visually-rich Markdown need these. Both are permissive (MIT), matching the
 # license pressure noted in para_config.txt.
 python-docx   # DOCX reader (MIT) — styles, fonts, tables, headers/footers
-pdfplumber    # digital-born PDF reader (MIT) — word/char bboxes, fonts, tables
+pdfplumber    # digital-born PDF reader (MIT) — word/char bboxes, fonts, tables (pulls pypdfium2)
+
+# Optional OCR path for scanned / curve-only PDF pages (pdf_to_md.py --ocr).
+# Needs the system Tesseract binary + Czech data, installed separately, e.g.:
+#   apt-get install tesseract-ocr tesseract-ocr-ces
+pytesseract   # Apache-2.0 wrapper around the Tesseract OCR engine

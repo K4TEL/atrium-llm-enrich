@@ -12,10 +12,13 @@ conversion tests are skipped cleanly where pdfplumber isn't installed.
 import pytest
 
 from api_util import pdf_to_md
-from api_util.pdf_to_md import _looks_garbled, _page_ocr_reason
+from api_util.pdf_to_md import _looks_garbled, _ocr_words_to_blocks, _page_ocr_reason
 
 requires_pdfplumber = pytest.mark.skipif(
     not pdf_to_md.pdfplumber_available(), reason="pdfplumber not installed"
+)
+requires_ocr = pytest.mark.skipif(
+    not pdf_to_md.ocr_available(), reason="Tesseract/pypdfium2 OCR stack not available"
 )
 
 
@@ -113,3 +116,57 @@ def test_convert_missing_lib_raises(monkeypatch, digital_pdf):
     monkeypatch.setattr(pdf_to_md, "pdfplumber_available", lambda: False)
     with pytest.raises(pdf_to_md.PdfPlumberNotInstalled):
         pdf_to_md.convert(digital_pdf)
+
+
+# --------------------------------------------------------------------------- #
+# OCR path
+# --------------------------------------------------------------------------- #
+def test_ocr_words_to_blocks_groups_and_scales():
+    # Two paragraphs (block/par 1,1 and 2,1); a blank + low-conf word are dropped.
+    data = {
+        "text": ["Vyzkum", "lokality", "", "Sonda"],
+        "conf": [95, 96, -1, 90],
+        "left": [72, 200, 0, 72],
+        "top": [59, 59, 0, 93],
+        "width": [100, 120, 0, 100],
+        "height": [17, 17, 0, 17],
+        "block_num": [1, 1, 1, 2],
+        "par_num": [1, 1, 1, 1],
+    }
+    blocks = _ocr_words_to_blocks(data, scale=1.0)
+    assert [b["text"] for b in blocks] == ["Vyzkum lokality", "Sonda"]
+    assert blocks[0]["bbox"] == [72, 59, 320, 76]  # union of the two word boxes
+    # scale converts rendered pixels back to points (e.g. 72/300)
+    halved = _ocr_words_to_blocks(data, scale=0.5)
+    assert halved[0]["bbox"] == [36, 30, 160, 38]
+
+
+def test_ocr_words_to_blocks_empty():
+    assert _ocr_words_to_blocks({"text": []}) == []
+
+
+@requires_ocr
+def test_convert_ocr_recovers_scanned_text(tmp_path):
+    """A rasterised (image-only) PDF has no text layer; --ocr recovers it."""
+    import pypdfium2 as pdfium
+
+    src = tmp_path / "born.pdf"
+    _write_min_pdf(
+        src,
+        "BT /F1 18 Tf 72 720 Td (Vyzkum lokality) Tj ET\n"
+        "BT /F1 12 Tf 72 690 Td (Sonda odhalila kostela.) Tj ET",
+        with_font=True,
+    )
+    pil = pdfium.PdfDocument(str(src))[0].render(scale=200 / 72).to_pil().convert("RGB")
+    scan = tmp_path / "CTX300.pdf"
+    pil.save(str(scan), "PDF", resolution=200)
+
+    # Without OCR: flagged; with OCR: transcribed with a provenance cue.
+    assert "<!-- NEEDS_OCR:" in pdf_to_md.convert(scan)
+    md = pdf_to_md.convert(scan, ocr=True)
+    assert "<!-- OCR: engine=tesseract, lang=ces -->" in md
+    # Tesseract may normalise diacritics (lang=ces), so assert on stable substrings.
+    assert "lokality" in md
+    assert "kostela" in md
+    assert "<!-- BBOX: [" in md
+    assert "NEEDS_OCR" not in md

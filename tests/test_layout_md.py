@@ -73,6 +73,11 @@ def test_header_footer_and_watermark():
     assert L.watermark("CONFIDENTIAL DRAFT") == '<!-- WATERMARK: "CONFIDENTIAL DRAFT" -->'
 
 
+def test_ocr_meta():
+    assert L.ocr_meta("tesseract", "ces") == "<!-- OCR: engine=tesseract, lang=ces -->"
+    assert L.ocr_meta("tesseract") == "<!-- OCR: engine=tesseract -->"
+
+
 # ── Inline Markdown forms ────────────────────────────────────────────────────
 
 

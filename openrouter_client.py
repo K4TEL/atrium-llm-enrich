@@ -37,11 +37,13 @@ from tqdm import tqdm
 
 from atrium_paradata import ParadataLogger
 from llm_client_shared import (
+    DOC_CONVERT_EXTENSIONS,
     build_document_schema,
     build_document_system_prompt,
     build_schema,
     build_system_prompt,
     load_config,
+    prepare_document_input,
     run_document_level,
     run_line_level,
 )
@@ -56,7 +58,9 @@ CONTEXT_RESERVED = MAX_NEW_TOKENS + 512
 _DOC_INPUT_EXTENSIONS = {".md", ".txt"}
 
 
-def _build_headers(api_key: str, site_url: Optional[str], app_name: Optional[str]) -> Dict[str, str]:
+def _build_headers(
+    api_key: str, site_url: Optional[str], app_name: Optional[str]
+) -> Dict[str, str]:
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     if site_url:
         headers["HTTP-Referer"] = site_url
@@ -153,18 +157,44 @@ def make_chat_fn(
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="llm_config.txt", help="Shared config file.")
-    parser.add_argument("--input", type=Path, default=None, help="File or directory (overrides INPUT_DIR).")
+    parser.add_argument(
+        "--input", type=Path, default=None, help="File or directory (overrides INPUT_DIR)."
+    )
     parser.add_argument("--output-dir", type=Path, default=None, help="Overrides OUTPUT_DIR.")
-    parser.add_argument("--model", default=None, help="OpenRouter model slug, e.g. 'openai/gpt-4o-mini'.")
+    parser.add_argument(
+        "--model", default=None, help="OpenRouter model slug, e.g. 'openai/gpt-4o-mini'."
+    )
     parser.add_argument("--api-key", default=None, help="Overrides OPENROUTER_API_KEY.")
-    parser.add_argument("--site-url", default=None, help="Sent as HTTP-Referer (OpenRouter app attribution).")
-    parser.add_argument("--app-name", default=None, help="Sent as X-Title (OpenRouter app attribution).")
+    parser.add_argument(
+        "--site-url", default=None, help="Sent as HTTP-Referer (OpenRouter app attribution)."
+    )
+    parser.add_argument(
+        "--app-name", default=None, help="Sent as X-Title (OpenRouter app attribution)."
+    )
     parser.add_argument("--provider-data-collection", choices=["allow", "deny"], default=None)
     parser.add_argument("--provider-only", default=None, help="Comma-separated provider allowlist.")
-    parser.add_argument("--provider-order", default=None, help="Comma-separated provider preference order.")
-    parser.add_argument("--structured-outputs", action="store_true", help="Send response_format=json_schema instead of json_object.")
-    parser.add_argument("--attach-as-file", action="store_true", help="Send .md/.txt input as a file content part (best-effort).")
-    parser.add_argument("--context-window", type=int, default=128_000, help="Model context window, for vocab-truncation budget.")
+    parser.add_argument(
+        "--provider-order", default=None, help="Comma-separated provider preference order."
+    )
+    parser.add_argument(
+        "--structured-outputs",
+        action="store_true",
+        help="Send response_format=json_schema instead of json_object.",
+    )
+    parser.add_argument(
+        "--attach-as-file",
+        action="store_true",
+        help="Send .md/.txt input as a file content part (best-effort).",
+    )
+    parser.add_argument(
+        "--ocr", action="store_true", help="OCR text-less pages when auto-converting .pdf inputs."
+    )
+    parser.add_argument(
+        "--context-window",
+        type=int,
+        default=128_000,
+        help="Model context window, for vocab-truncation budget.",
+    )
     parser.add_argument("--max-retries", type=int, default=3)
     parser.add_argument("--timeout", type=int, default=120)
     return parser
@@ -174,14 +204,22 @@ def main(argv: Optional[List[str]] = None) -> None:
     args = build_arg_parser().parse_args(argv)
     config = load_config(args.config)
 
-    api_key = args.api_key or os.environ.get("OPENROUTER_API_KEY") or config.get("OPENROUTER_API_KEY")
+    api_key = (
+        args.api_key or os.environ.get("OPENROUTER_API_KEY") or config.get("OPENROUTER_API_KEY")
+    )
     if not api_key:
-        print("[ERROR] No OpenRouter API key: pass --api-key or set OPENROUTER_API_KEY.", file=sys.stderr)
+        print(
+            "[ERROR] No OpenRouter API key: pass --api-key or set OPENROUTER_API_KEY.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     model = args.model or config.get("OPENROUTER_MODEL")
     if not model:
-        print("[ERROR] No model: pass --model or set OPENROUTER_MODEL in llm_config.txt.", file=sys.stderr)
+        print(
+            "[ERROR] No model: pass --model or set OPENROUTER_MODEL in llm_config.txt.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     input_path = args.input or Path(config.get("INPUT_DIR", "data_samples/DOC_LINE_LANG_CLASS"))
@@ -202,13 +240,20 @@ def main(argv: Optional[List[str]] = None) -> None:
         args.provider_data_collection, args.provider_only, args.provider_order
     )
 
-    print(f"\n=== LLM Semantic Enrichment Pipeline (BACKEND=openrouter) ===\n    model:   {model}\n    output:  {output_dir}\n")
+    print(
+        f"\n=== LLM Semantic Enrichment Pipeline (BACKEND=openrouter) ===\n    model:   {model}\n    output:  {output_dir}\n"
+    )
     if provider_block:
         print(f"  Provider routing: {provider_block}")
 
     logger = ParadataLogger(
         program="llm-enrich",
-        config={**config, "backend": "openrouter", "model": model, "output_dir_resolved": str(output_dir)},
+        config={
+            **config,
+            "backend": "openrouter",
+            "model": model,
+            "output_dir_resolved": str(output_dir),
+        },
         paradata_dir=paradata_dir,
         output_types=["json"],
     )
@@ -219,7 +264,9 @@ def main(argv: Optional[List[str]] = None) -> None:
 
         max_input_tokens = args.context_window - CONTEXT_RESERVED
         line_prompt, line_terms = build_system_prompt(vocab_data, max_tokens=max_input_tokens)
-        doc_prompt, doc_terms = build_document_system_prompt(vocab_data, max_tokens=max_input_tokens)
+        doc_prompt, doc_terms = build_document_system_prompt(
+            vocab_data, max_tokens=max_input_tokens
+        )
         LineModel = build_schema(line_terms)
         DocModel = build_document_schema(doc_terms)
 
@@ -228,14 +275,20 @@ def main(argv: Optional[List[str]] = None) -> None:
 
         line_schema = LineModel.model_json_schema() if args.structured_outputs else None
         doc_schema = DocModel.model_json_schema() if args.structured_outputs else None
-        line_chat_fn = make_chat_fn(session, headers, model, line_schema, args.max_retries, args.timeout, provider_block)
-        doc_chat_fn = make_chat_fn(session, headers, model, doc_schema, args.max_retries, args.timeout, provider_block)
+        line_chat_fn = make_chat_fn(
+            session, headers, model, line_schema, args.max_retries, args.timeout, provider_block
+        )
+        doc_chat_fn = make_chat_fn(
+            session, headers, model, doc_schema, args.max_retries, args.timeout, provider_block
+        )
 
         def _make_doc_builder(filename: str) -> Callable[[str], Any]:
             """Per-document user-content builder for run_document_level(); routes
             the .md/.txt body through _build_attachment_content so --attach-as-file
             actually takes effect (inlined text when the flag is off)."""
-            return lambda doc_text: _build_attachment_content(doc_text, filename, args.attach_as_file)
+            return lambda doc_text: _build_attachment_content(
+                doc_text, filename, args.attach_as_file
+            )
 
         if input_path.is_file():
             input_files = [input_path]
@@ -244,6 +297,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 p
                 for p in input_path.iterdir()
                 if p.suffix.lower() in _DOC_INPUT_EXTENSIONS
+                or p.suffix.lower() in DOC_CONVERT_EXTENSIONS
                 or p.suffix.lower() == ".csv"
                 or p.name.lower().endswith(".teitok.xml")
             )
@@ -254,6 +308,14 @@ def main(argv: Optional[List[str]] = None) -> None:
             out_file = output_dir / f"{doc_id}_enriched.json"
             if out_file.exists():
                 logger.log_skip(f.name, "already_exists")
+                continue
+
+            # .pdf/.docx → visually-rich .md (document-level) before dispatch.
+            try:
+                f = prepare_document_input(f, ocr=args.ocr)
+            except Exception as exc:
+                tqdm.write(f"  [skip] {f.name}: conversion failed ({exc})")
+                logger.log_skip(f.name, f"conversion_failed: {exc}")
                 continue
 
             try:

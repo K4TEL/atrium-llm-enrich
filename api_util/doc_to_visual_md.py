@@ -40,17 +40,19 @@ def is_supported(path: str | Path) -> bool:
     return Path(path).suffix.lower() in SUPPORTED_EXTENSIONS
 
 
-def convert_to_visual_md(path: str | Path) -> str:
-    """Convert a DOCX or digital-born PDF to visually-rich Markdown.
+def convert_to_visual_md(path: str | Path, ocr: bool = False) -> str:
+    """Convert a DOCX or PDF to visually-rich Markdown.
 
-    Raises ``ValueError`` for unsupported extensions, and the converter's own
-    ``*NotInstalled`` error when the backing library is missing.
+    ``ocr`` (PDF only) transcribes scanned / curve-only pages with Tesseract
+    instead of flagging them ``NEEDS_OCR``. Raises ``ValueError`` for unsupported
+    extensions, and the converter's own ``*NotInstalled`` error when the backing
+    library is missing.
     """
     ext = Path(path).suffix.lower()
     if ext == ".docx":
         return docx_to_md.convert(path)
     if ext == ".pdf":
-        return pdf_to_md.convert(path)
+        return pdf_to_md.convert(path, ocr=ocr)
     raise ValueError(
         f"Unsupported input '{ext or '(none)'}'. "
         f"Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}."
@@ -65,6 +67,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output", type=Path, default=None, help="Write to file instead of stdout."
     )
+    parser.add_argument(
+        "--ocr", action="store_true", help="PDF only: transcribe text-less pages with Tesseract."
+    )
     args = parser.parse_args()
 
     if not args.input_file.exists():
@@ -72,7 +77,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     try:
-        rendered = convert_to_visual_md(args.input_file)
+        rendered = convert_to_visual_md(args.input_file, ocr=args.ocr)
     except ValueError as exc:
         print(exc, file=sys.stderr)
         sys.exit(2)

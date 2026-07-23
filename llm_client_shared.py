@@ -388,7 +388,9 @@ def _collect_vocab_terms(vocab_data: dict) -> List[dict]:
     return raw_terms
 
 
-def _render_vocab_prompt(header: str, term_list: List[dict], other_cap: int = 15, footer: str = "") -> str:
+def _render_vocab_prompt(
+    header: str, term_list: List[dict], other_cap: int = 15, footer: str = ""
+) -> str:
     """Render ``term_list`` under ``header``, grouped by theme, with an
     'Other (Misc)' tail capped at ``other_cap`` terms, then ``footer``.
 
@@ -485,7 +487,12 @@ def build_system_prompt(
     dependency, at the cost of an approximate (not exact) token budget."""
     raw_terms = _collect_vocab_terms(vocab_data)
     return _fit_vocab_prompt(
-        _SYSTEM_HEADER, raw_terms, max_tokens, skip_truncation, footer=_EXAMPLES_FOOTER, verbose=True
+        _SYSTEM_HEADER,
+        raw_terms,
+        max_tokens,
+        skip_truncation,
+        footer=_EXAMPLES_FOOTER,
+        verbose=True,
     )
 
 
@@ -499,8 +506,14 @@ _DOC_SYSTEM_HEADER = (
     "the document, unique enough to locate the passage (prefer including the "
     "'## Page N' heading text nearest above it if the document has page "
     "headings).\n"
+    "  - page: the page number of that passage, read from the nearest "
+    "'<!-- PAGE_BREAK: pg_N -->' or '## Page N' marker ABOVE it (just the number/"
+    "label, e.g. 3); null if the document has no page markers.\n"
     "  - extracted_keywords_cs / extracted_keywords_en, teater_category, "
     "confidence_score — same meaning as the single-line task.\n"
+    "The document may contain HTML-comment layout cues (e.g. "
+    "'<!-- BBOX: … -->', '<!-- FONT: … -->'); use them as positional hints but "
+    "never extract or quote them as content.\n"
     "Administrative text, tables of contents, headings, author names, and "
     "literature references are NOT extraction targets — skip them entirely "
     "rather than emitting a 'Nerelevantní (meta-text)' item for each. "
@@ -525,6 +538,14 @@ def build_document_schema(term_names: List[str]) -> type:
         locator: str = Field(
             ...,
             description="Short verbatim snippet (max 8 words) copied exactly from the document.",
+        )
+        page: Optional[str] = Field(
+            None,
+            description=(
+                "Page number/label of the located passage, taken from the nearest "
+                "'<!-- PAGE_BREAK: pg_N -->' or '## Page N' marker above it "
+                "(a string so labels like 'iv' or 'A-1' are allowed). Null if unknown."
+            ),
         )
         extracted_keywords_cs: List[str] = Field(default_factory=list)
         extracted_keywords_en: List[str] = Field(default_factory=list)
@@ -551,7 +572,40 @@ def build_document_system_prompt(
     """Same vocabulary-injection/truncation as build_system_prompt(), with the
     whole-document instruction header instead of the single-line one."""
     raw_terms = _collect_vocab_terms(vocab_data)
-    return _fit_vocab_prompt(_DOC_SYSTEM_HEADER, raw_terms, max_tokens, skip_truncation, verbose=False)
+    return _fit_vocab_prompt(
+        _DOC_SYSTEM_HEADER, raw_terms, max_tokens, skip_truncation, verbose=False
+    )
+
+
+# Inputs that aren't a native pipeline format but can be pre-converted to
+# visually-rich Markdown (document-level) on the fly — see prepare_document_input.
+DOC_CONVERT_EXTENSIONS = frozenset({".pdf", ".docx"})
+
+
+def prepare_document_input(path: Path, cache_dir: Optional[Path] = None, ocr: bool = False) -> Path:
+    """Resolve an input file to something the pipeline can read.
+
+    ``.pdf`` / ``.docx`` are converted to visually-rich Markdown (via
+    ``api_util.doc_to_visual_md``) and cached as ``<stem>.md`` under a
+    ``_visual_md_cache`` sibling dir (not re-scanned by the top-level input
+    enumeration); the cached path is returned. The conversion is idempotent —
+    skipped when the cached ``.md`` is newer than the source. Any other file
+    type is returned unchanged. The heavy converter deps are imported lazily so
+    remote/lightweight clients don't pull them unless a PDF/DOCX is actually fed.
+    """
+    path = Path(path)
+    if path.suffix.lower() not in DOC_CONVERT_EXTENSIONS:
+        return path
+
+    from api_util.doc_to_visual_md import convert_to_visual_md
+
+    cache = Path(cache_dir) if cache_dir else path.parent / "_visual_md_cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    out = cache / f"{path.stem}.md"
+    if out.exists() and out.stat().st_mtime >= path.stat().st_mtime:
+        return out
+    out.write_text(convert_to_visual_md(path, ocr=ocr), encoding="utf-8")
+    return out
 
 
 def run_document_level(
@@ -577,7 +631,9 @@ def run_document_level(
     stats: Dict[str, int] = {"processed": 0, "skipped_filter": 0, "skipped_error": 0, "aborted": 0}
 
     doc_text = Path(input_path).read_text(encoding="utf-8")
-    user_content: Any = user_content_builder(doc_text) if user_content_builder else f"DOCUMENT:\n{doc_text}"
+    user_content: Any = (
+        user_content_builder(doc_text) if user_content_builder else f"DOCUMENT:\n{doc_text}"
+    )
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_content},
@@ -607,6 +663,7 @@ def run_document_level(
             {
                 "file_id": file_id,
                 "locator": dump_data.pop("locator"),
+                "page": dump_data.pop("page", None),
                 "enrichment": dump_data,
             }
         )
@@ -701,7 +758,9 @@ def run_line_level(
             ]
 
             result_json = chat_fn(messages)
-            dump_data = validate_llm_output(result_json, EnrichmentModel, file_id, page_num, line_num)
+            dump_data = validate_llm_output(
+                result_json, EnrichmentModel, file_id, page_num, line_num
+            )
 
             enriched_lines.append(
                 {

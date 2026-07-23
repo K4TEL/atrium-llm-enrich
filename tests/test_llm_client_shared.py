@@ -14,6 +14,7 @@ behavioural difference between backends in production.
 """
 
 import json
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -75,7 +76,9 @@ def test_should_process_line_noise_rejection():
 def test_should_process_line_low_quality_score_forces_trash():
     # quality_score < 0.40 always downgrades categ to "Trash" regardless of the
     # original categ value, then Trash is always skipped.
-    should_proc, reason = should_process_line("Reasonably long text", "Text", 0.10, True, 3, 8, 0.40)
+    should_proc, reason = should_process_line(
+        "Reasonably long text", "Text", 0.10, True, 3, 8, 0.40
+    )
     assert not should_proc
     assert "Trash" in reason
 
@@ -83,7 +86,9 @@ def test_should_process_line_low_quality_score_forces_trash():
 def test_should_process_line_mid_quality_score_forces_noisy_but_keeps():
     # 0.40 <= quality_score < 0.70 downgrades to "Noisy", which is NOT in
     # _ALWAYS_SKIP_CATEG, so a long-enough line still passes.
-    should_proc, _ = should_process_line("Reasonably long text here", "Text", 0.55, True, 3, 8, 0.40)
+    should_proc, _ = should_process_line(
+        "Reasonably long text here", "Text", 0.55, True, 3, 8, 0.40
+    )
     assert should_proc
 
 
@@ -189,7 +194,9 @@ class _DummyEnrichment:
 
 
 def test_validate_llm_output_success():
-    valid_json = '{"teater_category": "kostel", "confidence_score": 0.95, "extracted_keywords_cs": ["Jan"]}'
+    valid_json = (
+        '{"teater_category": "kostel", "confidence_score": 0.95, "extracted_keywords_cs": ["Jan"]}'
+    )
     result = validate_llm_output(valid_json, _DummyEnrichment, "doc1", 1, 1)
     assert result["teater_category"] == "kostel"
     assert result["confidence_score"] == 0.95
@@ -198,7 +205,9 @@ def test_validate_llm_output_success():
 def test_validate_llm_output_fallback_clamps_confidence():
     # confidence_score=1.5 fails strict model_validate_json (per _DummyEnrichment's
     # simulated Field(le=1.0)); the fallback path clamps it into [0, 1].
-    recoverable_json = '{"teater_category": "kostel", "confidence_score": 1.5, "extracted_keywords_cs": ["x"]}'
+    recoverable_json = (
+        '{"teater_category": "kostel", "confidence_score": 1.5, "extracted_keywords_cs": ["x"]}'
+    )
     result = validate_llm_output(recoverable_json, _DummyEnrichment, "doc1", 1, 1)
     assert result["confidence_score"] == 1.0
 
@@ -248,6 +257,25 @@ def test_build_document_schema_defaults_to_empty_items():
     assert instance.items == []
 
 
+def test_build_document_schema_exposes_optional_page():
+    Model = build_document_schema(["kostel"])
+    # page is optional (defaults to None) and accepts string labels
+    item_fields = Model.model_fields["items"].annotation
+    inst = Model.model_validate(
+        {"items": [{"locator": "x", "teater_category": "kostel", "confidence_score": 0.5}]}
+    )
+    assert inst.items[0].page is None
+    inst2 = Model.model_validate(
+        {
+            "items": [
+                {"locator": "x", "page": "iv", "teater_category": "kostel", "confidence_score": 0.5}
+            ]
+        }
+    )
+    assert inst2.items[0].page == "iv"
+    assert item_fields is not None  # schema built without error
+
+
 # ── run_line_level / run_document_level — end-to-end with a fake chat_fn ───
 
 
@@ -279,7 +307,9 @@ def test_run_line_level_processes_csv(tmp_path):
 def test_run_line_level_aborts_after_consecutive_errors(tmp_path):
     csv_path = tmp_path / "sample.csv"
     rows = "\n".join(f"doc1,1,{i},Text,0.95,line number {i} text" for i in range(1, 4))
-    csv_path.write_text("file_id,page_num,line_num,categ,quality_score,text\n" + rows + "\n", encoding="utf-8")
+    csv_path.write_text(
+        "file_id,page_num,line_num,categ,quality_score,text\n" + rows + "\n", encoding="utf-8"
+    )
 
     def _broken_chat_fn(messages):
         raise RuntimeError("simulated backend failure")
@@ -295,7 +325,9 @@ def test_run_line_level_aborts_after_consecutive_errors(tmp_path):
 
 def test_run_document_level_returns_located_items(tmp_path):
     doc_path = tmp_path / "sample.md"
-    doc_path.write_text("# doc1\n\n## Page 1\n\nVyzkum odhalil zaklady kostela.\n", encoding="utf-8")
+    doc_path.write_text(
+        "# doc1\n\n## Page 1\n\nVyzkum odhalil zaklady kostela.\n", encoding="utf-8"
+    )
 
     def _fake_doc_chat_fn(messages):
         return json.dumps(
@@ -303,6 +335,7 @@ def test_run_document_level_returns_located_items(tmp_path):
                 "items": [
                     {
                         "locator": "zaklady kostela",
+                        "page": "1",
                         "extracted_keywords_cs": ["z\u00e1klady"],
                         "extracted_keywords_en": ["foundations"],
                         "teater_category": "kostel",
@@ -316,4 +349,46 @@ def test_run_document_level_returns_located_items(tmp_path):
     results, stats = run_document_level(doc_path, _fake_doc_chat_fn, "system prompt", DocModel)
     assert stats["processed"] == 1
     assert results[0]["locator"] == "zaklady kostela"
+    assert results[0]["page"] == "1"  # surfaced at top level for [Source: \u2026, Page N]
+    assert "page" not in results[0]["enrichment"]  # not duplicated inside enrichment
     assert results[0]["enrichment"]["teater_category"] == "kostel"
+
+
+# \u2500\u2500 prepare_document_input (auto-convert seam) \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
+
+
+def test_prepare_document_input_passthrough_for_native(tmp_path):
+    from llm_client_shared import prepare_document_input
+
+    for name in ("a.md", "b.txt", "c.csv", "d.teitok.xml"):
+        p = tmp_path / name
+        p.write_text("x", encoding="utf-8")
+        assert prepare_document_input(p) == p  # unchanged
+
+
+def test_prepare_document_input_converts_and_caches(tmp_path, monkeypatch):
+    import llm_client_shared
+
+    calls = []
+
+    def fake_convert(path, ocr=False):
+        calls.append((str(path), ocr))
+        return f"# {Path(path).stem}\n\n## Page 1\n\nbody\n"
+
+    # convert_to_visual_md is imported lazily inside the helper from this module.
+    import api_util.doc_to_visual_md as dv
+
+    monkeypatch.setattr(dv, "convert_to_visual_md", fake_convert)
+
+    src = tmp_path / "report.pdf"
+    src.write_bytes(b"%PDF-1.4 dummy")
+    out = llm_client_shared.prepare_document_input(src)
+    assert out.name == "report.md"
+    assert out.parent.name == "_visual_md_cache"
+    assert out.read_text(encoding="utf-8").startswith("# report")
+    assert len(calls) == 1
+
+    # Idempotent: cached .md newer than source \u2192 no re-conversion.
+    out2 = llm_client_shared.prepare_document_input(src)
+    assert out2 == out
+    assert len(calls) == 1

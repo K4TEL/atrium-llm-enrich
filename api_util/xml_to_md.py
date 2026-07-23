@@ -28,6 +28,7 @@ _repo_root = str(Path(__file__).resolve().parent.parent)
 if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
 
+from api_util import layout_md as L  # noqa: E402
 from api_util.teitok_read import doc_id_from_path, read_teitok_rows  # noqa: E402
 
 
@@ -97,6 +98,209 @@ def read_document_rows(path: str | Path) -> List[dict]:
     return read_teitok_rows(path)
 
 
+def _parse_bbox_attr(value: str | None) -> list | None:
+    """Parse a TEITOK ``bbox="x1 y1 x2 y2"`` attribute into ``[x1, y1, x2, y2]``."""
+    if not value:
+        return None
+    parts = value.split()
+    if len(parts) != 4:
+        return None
+    try:
+        return [int(float(p)) for p in parts]
+    except (ValueError, TypeError):
+        return None
+
+
+def _alto_box(elem: ET.Element) -> list | None:
+    """[left, top, right, bottom] from an ALTO element's HPOS/VPOS/WIDTH/HEIGHT."""
+    try:
+        h = float(elem.get("HPOS", "") or "")
+        v = float(elem.get("VPOS", "") or "")
+        w = float(elem.get("WIDTH", "") or "")
+        ht = float(elem.get("HEIGHT", "") or "")
+    except (ValueError, TypeError):
+        return None
+    return [int(h), int(v), int(h + w), int(v + ht)]
+
+
+def _read_alto_layout(path: str | Path) -> tuple:
+    """ALTO → (rows, pages) with coordinates.
+
+    rows: [{"page_num", "line_num", "text", "bbox"}] (bbox = per-TextLine box).
+    pages: {page_num: {"width", "height", "figures": [{"bbox", "type"}]}} —
+    the page canvas size and any Illustration/GraphicalElement regions.
+    """
+    tree = ET.parse(path)
+    root = tree.getroot()
+    rows: List[dict] = []
+    pages: dict = {}
+
+    page_num = 0
+    for page_elem in root.iter():
+        if _local_tag(page_elem) != "Page":
+            continue
+        page_num += 1
+        try:
+            page_num = int(page_elem.get("PHYSICAL_IMG_NR", page_num))
+        except (TypeError, ValueError):
+            pass
+
+        def _int(v):
+            try:
+                return int(float(v))
+            except (ValueError, TypeError):
+                return None
+
+        pages.setdefault(page_num, {"width": None, "height": None, "figures": []})
+        pages[page_num]["width"] = _int(page_elem.get("WIDTH"))
+        pages[page_num]["height"] = _int(page_elem.get("HEIGHT"))
+
+        line_num = 0
+        for elem in page_elem.iter():
+            tag = _local_tag(elem)
+            if tag == "TextLine":
+                line_num += 1
+                words = [
+                    s.get("CONTENT", "")
+                    for s in elem.iter()
+                    if _local_tag(s) == "String" and s.get("CONTENT")
+                ]
+                text = " ".join(w for w in words if w).strip()
+                if text:
+                    rows.append(
+                        {
+                            "page_num": page_num,
+                            "line_num": line_num,
+                            "text": text,
+                            "bbox": _alto_box(elem),
+                        }
+                    )
+            elif tag in ("Illustration", "GraphicalElement"):
+                box = _alto_box(elem)
+                if box:
+                    pages[page_num]["figures"].append({"bbox": box, "type": tag})
+
+    return rows, pages
+
+
+def _read_teitok_layout(path: str | Path) -> tuple:
+    """TEITOK → (rows, pages) with coordinates.
+
+    Mirrors teitok_read.read_teitok_rows()'s page/line/text logic, plus a
+    per-sentence ``bbox`` (aggregated from child ``<tok bbox>``), page canvas
+    dimensions from ``<surface lrx lry>`` (in document order), and figure
+    regions from ``<figure bbox type>``.
+    """
+    tree = ET.parse(path)
+    root = tree.getroot()
+    rows: List[dict] = []
+    pages: dict = {}
+    surface_dims: List[tuple] = []
+
+    page_num = 1
+    line_num = 1
+    pages.setdefault(page_num, {"width": None, "height": None, "figures": []})
+
+    for elem in root.iter():
+        tag = _local_tag(elem)
+        if tag == "surface":
+            try:
+                surface_dims.append(
+                    (int(float(elem.get("lrx", "") or "")), int(float(elem.get("lry", "") or "")))
+                )
+            except (ValueError, TypeError):
+                surface_dims.append((None, None))
+        elif tag == "pb":
+            page_num = int(elem.get("n", page_num + 1))
+            pages.setdefault(page_num, {"width": None, "height": None, "figures": []})
+        elif tag == "lb":
+            line_num += 1
+        elif tag == "figure":
+            box = _parse_bbox_attr(elem.get("bbox"))
+            if box:
+                pages[page_num]["figures"].append({"bbox": box, "type": elem.get("type", "")})
+        elif tag == "s":
+            text = elem.get("text")
+            if not text:
+                toks = []
+                for tok in elem.iter():
+                    if _local_tag(tok) == "tok":
+                        toks.append(tok.text or "")
+                        if tok.get("join") != "right" and tok.get("spaceAfter") != "No":
+                            toks.append(" ")
+                text = "".join(toks).strip()
+            if not text:
+                continue
+            boxes = [
+                _parse_bbox_attr(tok.get("bbox"))
+                for tok in elem.iter()
+                if _local_tag(tok) == "tok" and tok.get("bbox")
+            ]
+            boxes = [b for b in boxes if b]
+            bbox = None
+            if boxes:
+                bbox = [
+                    min(b[0] for b in boxes),
+                    min(b[1] for b in boxes),
+                    max(b[2] for b in boxes),
+                    max(b[3] for b in boxes),
+                ]
+            rows.append({"page_num": page_num, "line_num": line_num, "text": text, "bbox": bbox})
+
+    # Surfaces are written one-per-page in document order; align by index.
+    for i, (w, h) in enumerate(surface_dims, start=1):
+        if i in pages:
+            pages[i]["width"] = w
+            pages[i]["height"] = h
+
+    return rows, pages
+
+
+def read_document_layout(path: str | Path) -> tuple:
+    """Reads (rows, pages) with coordinates from a TEITOK or ALTO document."""
+    path = Path(path)
+    if path.name.lower().endswith(".teitok.xml"):
+        return _read_teitok_layout(path)
+    if is_alto(path):
+        return _read_alto_layout(path)
+    return _read_teitok_layout(path)
+
+
+def rows_to_layout_markdown(rows: List[dict], pages: dict, title: str = "") -> str:
+    """Renders coordinate-bearing rows as visually-rich, page-sectioned Markdown.
+
+    Emits the same layout_md cue vocabulary as the PDF/DOCX converters —
+    ``## Page N`` + ``<!-- PAGE_BREAK -->``, ``<!-- DOC_META -->`` (canvas size),
+    ``<!-- BBOX -->`` per line, and ``![figure]`` placeholders — so TEITOK/ALTO
+    input lands on the one annotated-Markdown schema (issue #11).
+    """
+    pages = pages or {}
+    parts: List[str] = [f"# {title}"] if title else []
+    current_page = None
+
+    for row in rows:
+        page = row.get("page_num")
+        if page != current_page:
+            if current_page is not None:
+                parts.append(L.page_break(page))
+            parts.append(f"\n## Page {page}\n")
+            meta = pages.get(page, {})
+            w, h = meta.get("width"), meta.get("height")
+            if w and h:
+                parts.append(L.doc_meta(size=f"{w}x{h}px"))
+            for fig in meta.get("figures", []):
+                parts.append(L.image(fig.get("type", "figure"), "", fig.get("bbox")))
+            current_page = page
+
+        text = str(row.get("text", "")).strip()
+        if not text:
+            continue
+        box = row.get("bbox")
+        parts.append(f"{L.bbox(box)}\n{text}" if box else text)
+
+    return "\n".join(parts).strip() + "\n"
+
+
 def rows_to_markdown(rows: List[dict], title: str = "") -> str:
     """Renders {page_num, line_num, text} rows as page-sectioned Markdown."""
     if not rows:
@@ -132,8 +336,16 @@ def rows_to_plain_text(rows: List[dict]) -> str:
 
 
 def convert(path: str | Path, fmt: str = "markdown") -> str:
-    """Convert a TEITOK/ALTO XML document to 'markdown' or 'text'."""
+    """Convert a TEITOK/ALTO XML document to 'markdown', 'text', or 'layout'.
+
+    'layout' emits visually-rich Markdown carrying the layout_md cue vocabulary
+    (page dimensions, bounding boxes, page breaks, figures) — the same schema as
+    the PDF/DOCX converters.
+    """
     path = Path(path)
+    if fmt == "layout":
+        rows, pages = read_document_layout(path)
+        return rows_to_layout_markdown(rows, pages, title=doc_id_from_path(path))
     rows = read_document_rows(path)
     if fmt == "text":
         return rows_to_plain_text(rows)
@@ -143,8 +355,10 @@ def convert(path: str | Path, fmt: str = "markdown") -> str:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input_file", type=Path)
-    parser.add_argument("--format", choices=["markdown", "text"], default="markdown")
-    parser.add_argument("--output", type=Path, default=None, help="Write to file instead of stdout.")
+    parser.add_argument("--format", choices=["markdown", "text", "layout"], default="markdown")
+    parser.add_argument(
+        "--output", type=Path, default=None, help="Write to file instead of stdout."
+    )
     args = parser.parse_args()
 
     if not args.input_file.exists():

@@ -36,11 +36,13 @@ from tqdm import tqdm
 
 from atrium_paradata import ParadataLogger
 from llm_client_shared import (
+    DOC_CONVERT_EXTENSIONS,
     build_document_schema,
     build_document_system_prompt,
     build_schema,
     build_system_prompt,
     load_config,
+    prepare_document_input,
     run_document_level,
     run_line_level,
 )
@@ -128,14 +130,33 @@ def make_chat_fn(
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="llm_config.txt", help="Shared config file.")
-    parser.add_argument("--input", type=Path, default=None, help="File or directory (overrides INPUT_DIR).")
+    parser.add_argument(
+        "--input", type=Path, default=None, help="File or directory (overrides INPUT_DIR)."
+    )
     parser.add_argument("--output-dir", type=Path, default=None, help="Overrides OUTPUT_DIR.")
     parser.add_argument("--model", default=None, help="Ollama model tag, e.g. 'qwen2.5:7b'.")
-    parser.add_argument("--host", default=None, help="Overrides OLLAMA_HOST / http://localhost:11434.")
-    parser.add_argument("--context-window", type=int, default=32_000, help="Model context window, for vocab-truncation budget.")
-    parser.add_argument("--skip-pull-check", action="store_true", help="Skip the /api/tags + auto-pull step.")
+    parser.add_argument(
+        "--host", default=None, help="Overrides OLLAMA_HOST / http://localhost:11434."
+    )
+    parser.add_argument(
+        "--context-window",
+        type=int,
+        default=32_000,
+        help="Model context window, for vocab-truncation budget.",
+    )
+    parser.add_argument(
+        "--skip-pull-check", action="store_true", help="Skip the /api/tags + auto-pull step."
+    )
+    parser.add_argument(
+        "--ocr", action="store_true", help="OCR text-less pages when auto-converting .pdf inputs."
+    )
     parser.add_argument("--max-retries", type=int, default=3)
-    parser.add_argument("--timeout", type=int, default=300, help="Per-request timeout — local inference can be slow on CPU.")
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=300,
+        help="Per-request timeout — local inference can be slow on CPU.",
+    )
     return parser
 
 
@@ -143,10 +164,17 @@ def main(argv: Optional[List[str]] = None) -> None:
     args = build_arg_parser().parse_args(argv)
     config = load_config(args.config)
 
-    host = (args.host or os.environ.get("OLLAMA_HOST") or config.get("OLLAMA_HOST") or DEFAULT_OLLAMA_HOST).rstrip("/")
+    host = (
+        args.host
+        or os.environ.get("OLLAMA_HOST")
+        or config.get("OLLAMA_HOST")
+        or DEFAULT_OLLAMA_HOST
+    ).rstrip("/")
     model = args.model or config.get("OLLAMA_MODEL")
     if not model:
-        print("[ERROR] No model: pass --model or set OLLAMA_MODEL in llm_config.txt.", file=sys.stderr)
+        print(
+            "[ERROR] No model: pass --model or set OLLAMA_MODEL in llm_config.txt.", file=sys.stderr
+        )
         sys.exit(1)
 
     input_path = args.input or Path(config.get("INPUT_DIR", "data_samples/DOC_LINE_LANG_CLASS"))
@@ -163,7 +191,9 @@ def main(argv: Optional[List[str]] = None) -> None:
     min_char_non_text = int(config.get("MIN_CHAR_NON_TEXT", "8"))
     min_alpha_ratio_non_text = float(config.get("MIN_ALPHA_RATIO_NON_TEXT", "0.40"))
 
-    print(f"\n=== LLM Semantic Enrichment Pipeline (BACKEND=ollama) ===\n    host:    {host}\n    model:   {model}\n    output:  {output_dir}\n")
+    print(
+        f"\n=== LLM Semantic Enrichment Pipeline (BACKEND=ollama) ===\n    host:    {host}\n    model:   {model}\n    output:  {output_dir}\n"
+    )
 
     session = requests.Session()
     if not args.skip_pull_check:
@@ -171,7 +201,13 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     logger = ParadataLogger(
         program="llm-enrich",
-        config={**config, "backend": "ollama", "model": model, "host": host, "output_dir_resolved": str(output_dir)},
+        config={
+            **config,
+            "backend": "ollama",
+            "model": model,
+            "host": host,
+            "output_dir_resolved": str(output_dir),
+        },
         paradata_dir=paradata_dir,
         output_types=["json"],
     )
@@ -182,12 +218,18 @@ def main(argv: Optional[List[str]] = None) -> None:
 
         max_input_tokens = args.context_window - CONTEXT_RESERVED
         line_prompt, line_terms = build_system_prompt(vocab_data, max_tokens=max_input_tokens)
-        doc_prompt, doc_terms = build_document_system_prompt(vocab_data, max_tokens=max_input_tokens)
+        doc_prompt, doc_terms = build_document_system_prompt(
+            vocab_data, max_tokens=max_input_tokens
+        )
         LineModel = build_schema(line_terms)
         DocModel = build_document_schema(doc_terms)
 
-        line_chat_fn = make_chat_fn(session, host, model, LineModel.model_json_schema(), args.max_retries, args.timeout)
-        doc_chat_fn = make_chat_fn(session, host, model, DocModel.model_json_schema(), args.max_retries, args.timeout)
+        line_chat_fn = make_chat_fn(
+            session, host, model, LineModel.model_json_schema(), args.max_retries, args.timeout
+        )
+        doc_chat_fn = make_chat_fn(
+            session, host, model, DocModel.model_json_schema(), args.max_retries, args.timeout
+        )
 
         if input_path.is_file():
             input_files = [input_path]
@@ -196,6 +238,7 @@ def main(argv: Optional[List[str]] = None) -> None:
                 p
                 for p in input_path.iterdir()
                 if p.suffix.lower() in _DOC_INPUT_EXTENSIONS
+                or p.suffix.lower() in DOC_CONVERT_EXTENSIONS
                 or p.suffix.lower() == ".csv"
                 or p.name.lower().endswith(".teitok.xml")
             )
@@ -206,6 +249,14 @@ def main(argv: Optional[List[str]] = None) -> None:
             out_file = output_dir / f"{doc_id}_enriched.json"
             if out_file.exists():
                 logger.log_skip(f.name, "already_exists")
+                continue
+
+            # .pdf/.docx → visually-rich .md (document-level) before dispatch.
+            try:
+                f = prepare_document_input(f, ocr=args.ocr)
+            except Exception as exc:
+                tqdm.write(f"  [skip] {f.name}: conversion failed ({exc})")
+                logger.log_skip(f.name, f"conversion_failed: {exc}")
                 continue
 
             try:

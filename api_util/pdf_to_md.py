@@ -22,7 +22,6 @@ imported lazily so the base install never requires it — mirroring
 from __future__ import annotations
 
 import argparse
-import logging
 import re
 import statistics
 import sys
@@ -30,8 +29,6 @@ import unicodedata
 from collections import Counter
 from pathlib import Path
 from typing import List, Optional
-
-logger = logging.getLogger(__name__)
 
 _repo_root = str(Path(__file__).resolve().parent.parent)
 if _repo_root not in sys.path:
@@ -185,9 +182,92 @@ def _block_md(block: List[dict]) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# OCR path (opt-in) — scanned / curve-only pages have no trustworthy text layer
+# --------------------------------------------------------------------------- #
+DEFAULT_OCR_LANG = "ces"  # Czech, matching the in-domain AMCR corpus
+DEFAULT_OCR_DPI = 300
+
+
+def ocr_available() -> bool:
+    """Whether the opt-in OCR stack (pytesseract + binary + pypdfium2) is usable."""
+    try:
+        import pypdfium2  # noqa: F401
+        import pytesseract
+    except ImportError:
+        return False
+    try:
+        pytesseract.get_tesseract_version()
+        return True
+    except Exception:
+        return False
+
+
+def _ocr_words_to_blocks(data: dict, scale: float = 1.0, min_conf: float = 0.0) -> List[dict]:
+    """Group a pytesseract ``image_to_data`` DICT into paragraph blocks.
+
+    Words are grouped by Tesseract's (block_num, par_num); each block's bbox is
+    the union of its word boxes, scaled by ``scale`` (e.g. 72/dpi to convert
+    rendered pixels back to PDF points). Pure — testable without the binary.
+    """
+    from collections import OrderedDict
+
+    n = len(data.get("text", []))
+    groups: "OrderedDict[tuple, dict]" = OrderedDict()
+    for i in range(n):
+        txt = (data["text"][i] or "").strip()
+        if not txt:
+            continue
+        try:
+            conf = float(data["conf"][i])
+        except (ValueError, TypeError):
+            conf = -1.0
+        if conf < min_conf:
+            continue
+        key = (data.get("block_num", [0] * n)[i], data.get("par_num", [0] * n)[i])
+        x0, y0 = data["left"][i], data["top"][i]
+        x1, y1 = x0 + data["width"][i], y0 + data["height"][i]
+        g = groups.get(key)
+        if g is None:
+            groups[key] = {"words": [txt], "x0": x0, "y0": y0, "x1": x1, "y1": y1}
+        else:
+            g["words"].append(txt)
+            g["x0"], g["y0"] = min(g["x0"], x0), min(g["y0"], y0)
+            g["x1"], g["y1"] = max(g["x1"], x1), max(g["y1"], y1)
+
+    blocks = []
+    for g in groups.values():
+        bbox = [
+            round(g["x0"] * scale),
+            round(g["y0"] * scale),
+            round(g["x1"] * scale),
+            round(g["y1"] * scale),
+        ]
+        blocks.append({"bbox": bbox, "text": " ".join(g["words"])})
+    return blocks
+
+
+def _ocr_page(ocr_ctx: dict, page_num: int) -> Optional[List[str]]:
+    """Render a page and OCR it → Markdown parts, or None if OCR recovered nothing."""
+    import pytesseract
+
+    pdf = ocr_ctx["pdf"]
+    lang = ocr_ctx["lang"]
+    dpi = ocr_ctx["dpi"]
+    pil = pdf[page_num - 1].render(scale=dpi / 72.0).to_pil()
+    data = pytesseract.image_to_data(pil, lang=lang, output_type=pytesseract.Output.DICT)
+    blocks = _ocr_words_to_blocks(data, scale=72.0 / dpi)
+
+    parts: List[str] = [L.ocr_meta("tesseract", lang)]
+    for block in blocks:
+        if block["text"].strip():
+            parts.append(f"{L.bbox(block['bbox'])}\n{block['text']}")
+    return parts if len(parts) > 1 else None
+
+
+# --------------------------------------------------------------------------- #
 # Per-page rendering
 # --------------------------------------------------------------------------- #
-def _render_page(page, page_num: int) -> List[str]:
+def _render_page(page, page_num: int, ocr_ctx: Optional[dict] = None) -> List[str]:
     """Render a single pdfplumber page to a list of Markdown parts."""
     parts: List[str] = []
     if page_num > 1:
@@ -200,7 +280,13 @@ def _render_page(page, page_num: int) -> List[str]:
     text = page.extract_text() or ""
     ocr_reason = _page_ocr_reason(text)
     if ocr_reason:
-        parts.append(L.needs_ocr(page_num, ocr_reason))
+        ocr_parts = None
+        if ocr_ctx is not None:
+            try:
+                ocr_parts = _ocr_page(ocr_ctx, page_num)
+            except Exception as exc:  # never let OCR failure abort the document
+                print(f"  [pdf_to_md] OCR failed on page {page_num}: {exc}", file=sys.stderr)
+        parts.extend(ocr_parts if ocr_parts else [L.needs_ocr(page_num, ocr_reason)])
         return parts
 
     # Tables first, so their regions can be excluded from flowing text.
@@ -212,13 +298,12 @@ def _render_page(page, page_num: int) -> List[str]:
             if rendered:
                 table_items.append((table.bbox[1], rendered, list(table.bbox)))
                 table_bboxes.append(table.bbox)
-    except Exception as exc:
-        logger.warning("Table detection failed on page %d; tables skipped: %s", page_num, exc)
+    except Exception:
+        pass
 
     try:
         lines = page.extract_text_lines(strip=True)
-    except Exception as exc:
-        logger.warning("Text-line extraction failed on page %d; page will be empty: %s", page_num, exc)
+    except Exception:
         lines = []
     lines = [ln for ln in lines if not _in_any_table(ln, table_bboxes)]
 
@@ -236,17 +321,46 @@ def _render_page(page, page_num: int) -> List[str]:
     return parts
 
 
-def convert(path: str | Path) -> str:
-    """Convert a digital-born ``.pdf`` to visually-rich, page-sectioned Markdown."""
+def convert(
+    path: str | Path,
+    ocr: bool = False,
+    ocr_lang: str = DEFAULT_OCR_LANG,
+    ocr_dpi: int = DEFAULT_OCR_DPI,
+) -> str:
+    """Convert a ``.pdf`` to visually-rich, page-sectioned Markdown.
+
+    Digital-born pages are extracted directly. Scanned / curve-only pages have
+    no trustworthy text layer: by default they are flagged ``NEEDS_OCR``; with
+    ``ocr=True`` (and the optional OCR stack installed) they are rendered and
+    transcribed with Tesseract instead. If OCR is requested but unavailable, the
+    pages fall back to the ``NEEDS_OCR`` marker rather than failing.
+    """
     if not pdfplumber_available():
         raise PdfPlumberNotInstalled(INSTALL_HINT) from None
     import pdfplumber
 
     path = Path(path)
-    parts: List[str] = [f"# {doc_id_from_path(path)}"]
-    with pdfplumber.open(str(path)) as pdf:
-        for i, page in enumerate(pdf.pages, start=1):
-            parts.extend(_render_page(page, i))
+    ocr_ctx = None
+    if ocr:
+        if ocr_available():
+            import pypdfium2 as pdfium
+
+            ocr_ctx = {"pdf": pdfium.PdfDocument(str(path)), "lang": ocr_lang, "dpi": ocr_dpi}
+        else:
+            print(
+                "  [pdf_to_md] --ocr requested but Tesseract/pypdfium2 unavailable; "
+                "leaving NEEDS_OCR markers.",
+                file=sys.stderr,
+            )
+
+    try:
+        parts: List[str] = [f"# {doc_id_from_path(path)}"]
+        with pdfplumber.open(str(path)) as pdf:
+            for i, page in enumerate(pdf.pages, start=1):
+                parts.extend(_render_page(page, i, ocr_ctx=ocr_ctx))
+    finally:
+        if ocr_ctx is not None:
+            ocr_ctx["pdf"].close()
     return "\n".join(parts).strip() + "\n"
 
 
@@ -256,6 +370,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output", type=Path, default=None, help="Write to file instead of stdout."
     )
+    parser.add_argument(
+        "--ocr", action="store_true", help="Transcribe text-less pages with Tesseract."
+    )
+    parser.add_argument(
+        "--ocr-lang", default=DEFAULT_OCR_LANG, help="Tesseract language (default: ces)."
+    )
+    parser.add_argument("--ocr-dpi", type=int, default=DEFAULT_OCR_DPI, help="Render DPI for OCR.")
     args = parser.parse_args()
 
     if not args.input_file.exists():
@@ -263,7 +384,9 @@ if __name__ == "__main__":
         sys.exit(1)
 
     try:
-        rendered = convert(args.input_file)
+        rendered = convert(
+            args.input_file, ocr=args.ocr, ocr_lang=args.ocr_lang, ocr_dpi=args.ocr_dpi
+        )
     except PdfPlumberNotInstalled as exc:
         print(exc, file=sys.stderr)
         sys.exit(1)

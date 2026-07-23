@@ -47,8 +47,9 @@ CUE_SCHEMA: dict[str, str] = {
     "FOOTER_START": "Opens a repeating page-footer region.",
     "FOOTER_END": "Closes a repeating page-footer region.",
     "WATERMARK": "Faded overlay text across the page (e.g. CONFIDENTIAL).",
-    # Pipeline signal (not from the issue taxonomy)
+    # Pipeline signals (not from the issue taxonomy)
     "NEEDS_OCR": "Page has no trustworthy text layer — route to the OCR path.",
+    "OCR": "OCR provenance: engine and language used to transcribe a page.",
 }
 
 # Inline Markdown forms (not HTML comments) also part of the taxonomy.
@@ -140,6 +141,16 @@ def needs_ocr(page_id, reason: str = "no extractable text layer") -> str:
     issue #10 / hub #22 benchmark) knows exactly which pages to re-transcribe.
     """
     return _comment(f"NEEDS_OCR: {_page_id(page_id)} ({reason})")
+
+
+def ocr_meta(engine: str, lang: Optional[str] = None) -> str:
+    """``<!-- OCR: engine=tesseract, lang=ces -->`` — page-transcription provenance.
+
+    Not part of the issue taxonomy — records that a page's text was recovered by
+    OCR (and with which engine/language), so downstream consumers can weight it
+    differently from a native text layer.
+    """
+    return _comment(f"OCR: {_kv([('engine', engine), ('lang', lang)])}")
 
 
 # --------------------------------------------------------------------------- #
