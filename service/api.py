@@ -1,407 +1,338 @@
-"""
-service/api.py — FastAPI surface for the llm-enrich keyword extraction.
+"""service/api.py — FastAPI surface for atrium-llm-enrich (strategy §4.2).
 
-Mirrors the atrium-nlp-enrich service layout: a thin HTTP wrapper over the
-existing remote/local-lightweight LLM clients, dispatched through
-llm_client_shared.py. The torch stack is deliberately NOT imported here —
-`backend=local` (transformers/vLLM) is CLI-only on the development branch and
-the API answers 501 for it, keeping this service installable from
-requirements_remote.txt alone (the repo's established constraint).
+Brings llm-enrich into API parity with the rest of the ATRIUM pipeline. It wraps the
+existing **remote / lightweight-local** enrichment engine (``llm_client_shared`` +
+``openrouter_client`` / ``ollama_client``) — deliberately the torch-free path, so the
+service stays in the no-model fast lane and never needs the GPU stack.
+
+Backend is selected with ``LLM_BACKEND`` (``openrouter`` default, or ``ollama``); the
+engine is warmed once on startup. A misconfigured backend (missing API key / model) does
+**not** crash the app: ``/info`` and ``/health`` stay up and report ``ready: false`` while
+the extraction endpoints answer 503 until configured.
 """
 
 from __future__ import annotations
 
 import asyncio
-import configparser
 import csv
-import os
-import sys
+import logging
 import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI, File, HTTPException, UploadFile
 
-# service/ lives one level below the repo root where all pipeline modules sit.
-_SERVICE_DIR = Path(__file__).resolve().parent
-_REPO_ROOT = _SERVICE_DIR.parent
-if str(_REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(_REPO_ROOT))
-
-import ollama_client  # noqa: E402
-import openrouter_client  # noqa: E402
-import requests  # noqa: E402
-from llm_client_shared import (  # noqa: E402
-    build_schema,
-    build_system_prompt,
-    load_config,
-    run_line_level,
+# Shared ATRIUM meta-contract helpers (§4). Byte-identical across every service,
+# enforced by para-drift.reusable.yml.
+from .atrium_service import (
+    add_cors,
+    attach_health,
+    build_info,
+    read_tool_version,
+    resolve_max_upload_mb,
 )
-from vocab_manager import VocabularyManager  # noqa: E402
 
-# ── operator-tunable limits ───────────────────────────────────────────────────
-MAX_UPLOAD_MB = float(os.environ.get("MAX_UPLOAD_MB", "5"))
-MAX_LINES = int(os.environ.get("MAX_LINES", "300"))
-MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "1"))
-API_JOB_TIMEOUT = int(os.environ.get("API_JOB_TIMEOUT", "1800"))
-CONTEXT_WINDOW = int(os.environ.get("CONTEXT_WINDOW", "32000"))
-CONTEXT_RESERVED = 4000  # kept for the model's answer + user message
-ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
+logger = logging.getLogger(__name__)
 
-SERVICE_NAME = "atrium-llm-enrich"
-API_ENDPOINTS = ["/info", "/health", "/extract_keywords", "/extract_keywords_text"]
-_ALLOWED_BACKENDS = ("openrouter", "ollama", "local")
-_INPUT_SUFFIXES = (".txt", ".csv", ".xml")
+# Canonical upload limit (§4.5).
+MAX_UPLOAD_MB = resolve_max_upload_mb(10)
+MAX_UPLOAD_BYTES = int(MAX_UPLOAD_MB * 1024 * 1024)
 
-_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
-_config: Dict[str, str] = {}
-_prompt_state: Dict[str, Any] = {}  # system_prompt, EnrichmentModel, schema_json, vocab_path
-_chat_state: Dict[str, Any] = {}  # per-backend cached chat_fn + model name
+# Reserved output-token budget subtracted from the context window when truncating the
+# vocabulary prompt. Mirrors {openrouter,ollama}_client: MAX_NEW_TOKENS (2048) + 512,
+# which those modules keep in sync with llm_utils by hand.
+_CONTEXT_RESERVED = 2048 + 512
+
+_LINE_SUFFIXES = (".csv", ".teitok.xml")
+_DOC_SUFFIXES = (".md", ".txt")
+
+# Warmed engine state (or an "error" key when the backend is unavailable).
+_engine: Dict[str, Any] = {}
 
 
-def _read_tool_version() -> str:
-    """Read the tool version from para_config.txt [tool] section (single source
-    of truth — validated against CITATION.cff by security.reusable.yml)."""
-    config = configparser.ConfigParser()
-    config.read(_REPO_ROOT / "para_config.txt", encoding="utf-8")
-    version = config.get("tool", "version", fallback="unknown")
-    return version[1:] if version.lower().startswith("v") else version
+def _load_engine() -> Dict[str, Any]:
+    """Build the enrichment engine for the configured backend (blocking).
 
+    Replicates the setup sequence of ``openrouter_client.main`` / ``ollama_client.main``:
+    load config + vocabulary, build the archaeological schema and system prompt, and bind
+    a ``chat_fn`` to the chosen remote/local backend. Heavy-ish imports are kept local so
+    importing this module (for contract tests) never requires ``requests``/vocab data.
+    """
+    import os
 
-def _default_backend() -> str:
-    return os.environ.get("BACKEND") or _config.get("BACKEND") or "openrouter"
+    import requests
 
-
-def _openrouter_key() -> Optional[str]:
-    return os.environ.get("OPENROUTER_API_KEY") or _config.get("OPENROUTER_API_KEY")
-
-
-def _ollama_host() -> str:
-    return (
-        os.environ.get("OLLAMA_HOST") or _config.get("OLLAMA_HOST") or ollama_client.DEFAULT_OLLAMA_HOST
-    ).rstrip("/")
-
-
-def _prepare_prompts() -> None:
-    """Load the TEATER/AMCR vocabulary and build the line-level prompt/schema
-    once; auto-syncs the vocabulary from the AMCR API when the cache file is
-    missing (can take minutes on a cold start)."""
-    vocab_path = _config.get("VOCAB_PATH", "data_samples/teater_nested_vocab.json")
-    if not Path(vocab_path).is_absolute():
-        vocab_path = str(_REPO_ROOT / vocab_path)
-    vocab_data = VocabularyManager(vocab_path=vocab_path).load()
-    system_prompt, terms = build_system_prompt(vocab_data, max_tokens=CONTEXT_WINDOW - CONTEXT_RESERVED)
-    model_cls = build_schema(terms)
-    _prompt_state.update(
-        {
-            "system_prompt": system_prompt,
-            "EnrichmentModel": model_cls,
-            "schema_json": model_cls.model_json_schema(),
-            "vocab_path": vocab_path,
-            "num_terms": len(terms),
-        }
+    from llm_client_shared import (
+        build_document_schema,
+        build_document_system_prompt,
+        build_schema,
+        build_system_prompt,
+        load_config,
     )
+    from vocab_manager import VocabularyManager
 
+    backend = os.getenv("LLM_BACKEND", "openrouter").lower()
+    config_path = os.getenv("LLM_CONFIG", "llm_config.txt")
+    config = load_config(config_path) if Path(config_path).exists() else {}
 
-def _get_chat_fn(backend: str):
-    """Build (and cache) a llm_client_shared.ChatFn for the chosen backend.
-    Raises HTTPException with an actionable detail when unconfigured."""
-    if backend in _chat_state:
-        return _chat_state[backend]["chat_fn"], _chat_state[backend]["model"]
+    vocab_path = os.getenv("VOCAB_PATH") or config.get(
+        "VOCAB_PATH", "data_samples/teater_nested_vocab.json"
+    )
+    context_window = int(os.getenv("LLM_CONTEXT_WINDOW", config.get("CONTEXT_WINDOW", "32000")))
+    max_retries = int(os.getenv("LLM_MAX_RETRIES", "3"))
+    timeout = int(os.getenv("LLM_TIMEOUT", "300"))
+    max_input_tokens = context_window - _CONTEXT_RESERVED
+
+    filter_params = {
+        "include_non_text": config.get("INCLUDE_NON_TEXT", "true").lower() == "true",
+        "min_char_count": int(config.get("MIN_CHAR_COUNT", "3")),
+        "min_char_non_text": int(config.get("MIN_CHAR_NON_TEXT", "8")),
+        "min_alpha_ratio_non_text": float(config.get("MIN_ALPHA_RATIO_NON_TEXT", "0.40")),
+    }
+
+    vocab_data = VocabularyManager(vocab_path=vocab_path).load()
+    line_prompt, line_terms = build_system_prompt(vocab_data, max_tokens=max_input_tokens)
+    doc_prompt, doc_terms = build_document_system_prompt(vocab_data, max_tokens=max_input_tokens)
+    line_model = build_schema(line_terms)
+    doc_model = build_document_schema(doc_terms)
+    session = requests.Session()
 
     if backend == "openrouter":
-        api_key = _openrouter_key()
-        if not api_key:
-            raise HTTPException(503, "OpenRouter backend not configured: set OPENROUTER_API_KEY.")
-        model = os.environ.get("OPENROUTER_MODEL") or _config.get("OPENROUTER_MODEL")
-        if not model:
-            raise HTTPException(503, "OpenRouter backend not configured: set OPENROUTER_MODEL in llm_config.txt.")
-        session = requests.Session()
-        headers = openrouter_client._build_headers(api_key, None, None)
-        chat_fn = openrouter_client.make_chat_fn(
-            session, headers, model, _prompt_state["schema_json"], max_retries=3, timeout=300, provider_block=None
-        )
-    elif backend == "ollama":
-        model = os.environ.get("OLLAMA_MODEL") or _config.get("OLLAMA_MODEL")
-        if not model:
-            raise HTTPException(503, "Ollama backend not configured: set OLLAMA_MODEL in llm_config.txt.")
-        host = _ollama_host()
-        session = requests.Session()
-        try:
-            ollama_client.ensure_model_pulled(host, model, session, timeout=300)
-        except Exception as exc:
-            raise HTTPException(503, f"Ollama unreachable at {host}: {exc}") from exc
-        chat_fn = ollama_client.make_chat_fn(session, host, model, _prompt_state["schema_json"], 3, 300)
-    elif backend == "local":
-        raise HTTPException(
-            501,
-            "backend=local (transformers/vLLM) is CLI-only on the development branch — "
-            "use backend=openrouter / backend=ollama via the API.",
-        )
-    else:
-        raise HTTPException(422, f"backend must be one of {_ALLOWED_BACKENDS}")
+        from openrouter_client import _build_headers, make_chat_fn
 
-    _chat_state[backend] = {"chat_fn": chat_fn, "model": model}
-    return chat_fn, model
+        api_key = os.getenv("OPENROUTER_API_KEY") or config.get("OPENROUTER_API_KEY")
+        model = os.getenv("OPENROUTER_MODEL") or config.get("OPENROUTER_MODEL")
+        if not api_key:
+            raise RuntimeError("OPENROUTER_API_KEY is not set")
+        if not model:
+            raise RuntimeError("OPENROUTER_MODEL is not set")
+        headers = _build_headers(
+            api_key, os.getenv("OPENROUTER_SITE_URL"), os.getenv("OPENROUTER_APP_NAME", "atrium-llm-enrich")
+        )
+        line_chat_fn = make_chat_fn(
+            session, headers, model, line_model.model_json_schema(), max_retries, timeout, None
+        )
+        doc_chat_fn = make_chat_fn(
+            session, headers, model, doc_model.model_json_schema(), max_retries, timeout, None
+        )
+        model_id = model
+    elif backend == "ollama":
+        from ollama_client import DEFAULT_OLLAMA_HOST, make_chat_fn
+
+        host = os.getenv("OLLAMA_HOST") or config.get("OLLAMA_HOST", DEFAULT_OLLAMA_HOST)
+        model = os.getenv("OLLAMA_MODEL") or config.get("OLLAMA_MODEL")
+        if not model:
+            raise RuntimeError("OLLAMA_MODEL is not set")
+        line_chat_fn = make_chat_fn(
+            session, host, model, line_model.model_json_schema(), max_retries, timeout
+        )
+        doc_chat_fn = make_chat_fn(
+            session, host, model, doc_model.model_json_schema(), max_retries, timeout
+        )
+        model_id = f"{model}@{host}"
+    else:
+        raise RuntimeError(f"Unknown LLM_BACKEND '{backend}' (expected 'openrouter' or 'ollama')")
+
+    return {
+        "backend": backend,
+        "model": model_id,
+        "line_prompt": line_prompt,
+        "line_model": line_model,
+        "line_chat_fn": line_chat_fn,
+        "doc_prompt": doc_prompt,
+        "doc_model": doc_model,
+        "doc_chat_fn": doc_chat_fn,
+        "filter_params": filter_params,
+    }
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    _config.update(load_config(str(_REPO_ROOT / "llm_config.txt")))
+    # Warm the backend once; a misconfigured backend is recorded, not fatal.
     loop = asyncio.get_event_loop()
     try:
-        await loop.run_in_executor(None, _prepare_prompts)
-    except Exception as exc:  # degraded start — surfaced via /health
-        print(f"[WARN] Vocabulary/prompt warmup failed: {exc}")
+        _engine.update(await loop.run_in_executor(None, _load_engine))
+        logger.info("llm-enrich engine ready (backend=%s)", _engine.get("backend"))
+    except Exception as exc:
+        _engine.clear()
+        _engine["error"] = str(exc)
+        logger.warning("llm-enrich engine warmup failed: %s", exc)
     yield
+    _engine.clear()
 
 
 app = FastAPI(
     title="ATRIUM llm-enrich API",
-    version=_read_tool_version(),
-    description="Vocabulary-guided LLM keyword extraction for archaeological archival text.",
+    version=read_tool_version(Path(__file__).resolve().parent),
+    description="LLM-based archaeological keyword extraction over text lines / documents.",
     lifespan=lifespan,
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_methods=["GET", "POST"],
-    allow_headers=["*"],
-)
-
-if (_SERVICE_DIR / "frontend").exists():
-    app.mount("/frontend", StaticFiles(directory=str(_SERVICE_DIR / "frontend"), html=True), name="frontend")
+# CORS — standard §4.5 configuration (ALLOWED_ORIGINS CSV, default "*").
+add_cors(app, methods=["GET", "POST"])
 
 
-@app.get("/", include_in_schema=False)
-async def root():
-    return RedirectResponse(url="/frontend")
+def _deep_health() -> str | None:
+    """Deep readiness (§4.1): the LLM backend warmed up and a chat_fn is bound."""
+    if _engine.get("error"):
+        return f"backend not configured: {_engine['error']}"
+    if not _engine.get("line_chat_fn"):
+        return "engine not initialized"
+    return None
+
+
+attach_health(app, deep_check=_deep_health)
+
+
+def _require_engine() -> Dict[str, Any]:
+    """Return the warmed engine, or 503 if the backend is not ready (§4.4 → client retries)."""
+    if _engine.get("error"):
+        raise HTTPException(503, f"LLM backend not ready: {_engine['error']}") from None
+    if not _engine.get("line_chat_fn"):
+        raise HTTPException(503, "LLM backend not initialized.") from None
+    return _engine
+
+
+def _doc_id(filename: str) -> str:
+    name = Path(filename).name
+    for suffix in (".teitok.xml", ".csv", ".md", ".txt"):
+        if name.lower().endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def _run_extraction(tmp_path: str, filename: str, engine: Dict[str, Any]) -> Dict[str, Any]:
+    """Blocking enrichment call, dispatched by file extension (line vs document level)."""
+    from llm_client_shared import run_document_level, run_line_level
+
+    name = filename.lower()
+    path = Path(tmp_path)
+    if name.endswith(_LINE_SUFFIXES):
+        records, stats = run_line_level(
+            path, engine["line_chat_fn"], engine["line_prompt"], engine["line_model"],
+            **engine["filter_params"],
+        )
+        mode = "line"
+    else:  # validated to be a _DOC_SUFFIXES file by the caller
+        records, stats = run_document_level(
+            path, engine["doc_chat_fn"], engine["doc_prompt"], engine["doc_model"]
+        )
+        mode = "document"
+    return {"mode": mode, "results": records, "stats": stats}
+
+
+def _envelope(engine: Dict[str, Any], doc_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "service": "atrium-llm-enrich",
+        "doc_id": doc_id,
+        "backend": engine["backend"],
+        "model": engine["model"],
+        **payload,
+    }
+
+
+async def _extract_from_path(tmp_path: str, filename: str, engine: Dict[str, Any]) -> Dict[str, Any]:
+    loop = asyncio.get_event_loop()
+    try:
+        return await loop.run_in_executor(None, _run_extraction, tmp_path, filename, engine)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except RuntimeError as exc:
+        # chat_fn exhausted its retries against the upstream LLM — retryable (§4.4).
+        raise HTTPException(502, f"LLM backend error: {exc}") from exc
 
 
 @app.get("/info")
 async def info() -> Dict[str, Any]:
-    return {
-        "service": SERVICE_NAME,
-        "version": app.version,
-        "endpoints": API_ENDPOINTS,
-        "limits": {
-            "max_upload_mb": MAX_UPLOAD_MB,
-            "max_lines": MAX_LINES,
-            "max_concurrent_jobs": MAX_CONCURRENT_JOBS,
-            "api_job_timeout_s": API_JOB_TIMEOUT,
-        },
-        "backends": {
-            "default": _default_backend(),
-            "openrouter": {
-                "configured": bool(_openrouter_key()),
-                "model": os.environ.get("OPENROUTER_MODEL") or _config.get("OPENROUTER_MODEL"),
-            },
-            "ollama": {
-                "host": _ollama_host(),
-                "model": os.environ.get("OLLAMA_MODEL") or _config.get("OLLAMA_MODEL"),
-            },
-            "local": "cli-only on the development branch (API answers 501)",
-        },
-        "vocabulary": {
-            "source": "TEATER/AMCR",
-            "path": _prompt_state.get("vocab_path"),
-            "num_terms": _prompt_state.get("num_terms"),
-            "ready": bool(_prompt_state),
-        },
-        "input_formats": ["TXT (plain lines)", "CSV (text[,page_num,line_num,categ,quality_score])", "TEITOK XML"],
-    }
-
-
-@app.get("/health")
-async def health(deep: bool = False) -> JSONResponse:
-    """Liveness (shallow) / readiness (deep=true, vocabulary + backend) probe."""
-    if not deep:
-        return JSONResponse({"status": "ok"})
-
-    if not _prompt_state:
-        return JSONResponse(
-            {"status": "degraded", "detail": "vocabulary/prompt warmup failed or still running"},
-            status_code=503,
-        )
-
-    backend = _default_backend()
-    detail: Dict[str, Any] = {"status": "ok", "backend": backend, "vocabulary_ready": True}
-    if backend == "openrouter":
-        if not _openrouter_key():
-            return JSONResponse(
-                {"status": "degraded", "detail": "OPENROUTER_API_KEY not set", "backend": backend},
-                status_code=503,
-            )
-        detail["api_key_present"] = True
-    elif backend == "ollama":
-        host = _ollama_host()
-        try:
-            requests.get(f"{host}/api/tags", timeout=5).raise_for_status()
-            detail["ollama_reachable"] = True
-        except Exception as exc:
-            return JSONResponse(
-                {"status": "degraded", "detail": f"Ollama unreachable at {host}: {exc}", "backend": backend},
-                status_code=503,
-            )
-    elif backend == "local":
-        detail["note"] = "backend=local is CLI-only; API requests answer 501"
-    return JSONResponse(detail)
-
-
-# ── request handling ───────────────────────────────────────────────────────────
-
-
-def _rows_to_temp_csv(rows: List[Dict[str, Any]], tmpdir: str, doc_id: str) -> Path:
-    """Materialize normalized rows as the canonical CSV the shared runner reads."""
-    path = Path(tmpdir) / f"{doc_id}.csv"
-    with open(path, "w", encoding="utf-8", newline="") as fh:
-        writer = csv.DictWriter(fh, fieldnames=["text", "page_num", "line_num", "categ", "quality_score"])
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(
-                {
-                    "text": row.get("text", ""),
-                    "page_num": row.get("page_num", 1),
-                    "line_num": row.get("line_num", ""),
-                    "categ": row.get("categ", ""),
-                    "quality_score": row.get("quality_score", 1.0),
-                }
-            )
-    return path
-
-
-def _normalize_upload(filename: str, data: bytes, tmpdir: str) -> Path:
-    """Turn an upload into a file path the shared runner understands."""
-    name = (filename or "upload.csv").lower()
-    doc_id = Path(name).stem.replace(".teitok", "") or "document"
-    if name.endswith(".txt"):
-        text = data.decode("utf-8-sig", errors="replace")
-        rows = [
-            {"text": line.strip(), "page_num": 1, "line_num": i}
-            for i, line in enumerate(text.splitlines(), start=1)
-            if line.strip()
-        ]
-        if not rows:
-            raise HTTPException(422, "No usable text lines found in the TXT upload.")
-        return _rows_to_temp_csv(rows, tmpdir, doc_id)
-    if name.endswith(".teitok.xml") or name.endswith(".xml"):
-        # read_input_rows special-cases *.teitok.xml — keep that suffix.
-        path = Path(tmpdir) / f"{doc_id}.teitok.xml"
-        path.write_bytes(data)
-        return path
-    if name.endswith(".csv"):
-        path = Path(tmpdir) / f"{doc_id}.csv"
-        path.write_bytes(data)
-        return path
-    raise HTTPException(
-        415,
-        "Unsupported media type. Allowed: .txt (plain lines), .csv (text column), .teitok.xml. "
-        "Convert ALTO XML to TEITOK/CSV first (see api_util/).",
+    """Service identity and capabilities (§4.1)."""
+    return build_info(
+        app,
+        service="atrium-llm-enrich",
+        limits={"max_upload_mb": MAX_UPLOAD_MB},
+        backend=_engine.get("backend"),
+        model=_engine.get("model"),
+        ready=not _engine.get("error") and bool(_engine.get("line_chat_fn")),
+        supported_inputs=[*_LINE_SUFFIXES, *_DOC_SUFFIXES],
+        languages=["cs", "en"],
     )
-
-
-def _run_extraction_sync(input_path: Path, backend: str, top_k: int) -> Dict[str, Any]:
-    chat_fn, model = _get_chat_fn(backend)
-    enriched, stats = run_line_level(
-        input_path,
-        chat_fn,
-        _prompt_state["system_prompt"],
-        _prompt_state["EnrichmentModel"],
-    )
-    lines = []
-    for record in enriched:
-        enrichment = record.get("enrichment") or {}
-        lines.append(
-            {
-                "page": record.get("page"),
-                "line": record.get("line"),
-                "text": record.get("original_text"),
-                "keywords_cs": (enrichment.get("extracted_keywords_cs") or [])[:top_k],
-                "keywords_en": (enrichment.get("extracted_keywords_en") or [])[:top_k],
-                "category": enrichment.get("teater_category", ""),
-                "confidence": enrichment.get("confidence_score"),
-            }
-        )
-    return {
-        "doc_id": input_path.stem.replace(".teitok", ""),
-        "backend": backend,
-        "model": model,
-        "vocabulary": "TEATER/AMCR",
-        "stats": stats,
-        "lines": lines,
-    }
-
-
-async def _extract_common(input_path: Path, backend: str, top_k: int):
-    if backend not in _ALLOWED_BACKENDS:
-        raise HTTPException(422, f"backend must be one of {_ALLOWED_BACKENDS}")
-    if not (1 <= top_k <= 50):
-        raise HTTPException(422, "top_k must be between 1 and 50")
-    if not _prompt_state:
-        raise HTTPException(503, "Vocabulary/prompt warmup failed or still running; check /health?deep=true.")
-
-    from llm_client_shared import read_input_rows
-
-    try:
-        num_rows = len(read_input_rows(input_path))
-    except Exception as exc:
-        raise HTTPException(422, f"Could not parse input: {exc}") from exc
-    if num_rows == 0:
-        raise HTTPException(422, "No usable rows found in input.")
-    if num_rows > MAX_LINES:
-        raise HTTPException(413, f"Input too large: {num_rows} lines > {MAX_LINES} (LLM budget guard).")
-
-    if _semaphore.locked():
-        raise HTTPException(429, "Server busy; max concurrent extractions reached. Retry later.")
-
-    async with _semaphore:
-        loop = asyncio.get_event_loop()
-        try:
-            envelope = await asyncio.wait_for(
-                loop.run_in_executor(None, _run_extraction_sync, input_path, backend, top_k),
-                timeout=API_JOB_TIMEOUT,
-            )
-        except asyncio.TimeoutError as exc:
-            raise HTTPException(504, "Keyword extraction timed out.") from exc
-    return JSONResponse(envelope)
 
 
 @app.post("/extract_keywords")
-async def extract_keywords(
-    file: UploadFile = File(...),  # noqa: B008
-    backend: str = Form(""),
-    top_k: int = Form(10),
-):
+async def extract_keywords(file: UploadFile = File(...)):  # noqa: B008
+    """Extract archaeological keywords from an uploaded document (§4.2).
+
+    ``.csv`` / ``*.teitok.xml`` → line-level (one record per qualifying line);
+    ``.md`` / ``.txt`` → document-level (one record set per document). Each record's
+    ``enrichment`` carries ``extracted_keywords_cs`` / ``extracted_keywords_en``.
+    """
+    engine = _require_engine()
+    if not file.filename:
+        raise HTTPException(422, "Filename is missing from the upload.") from None
+    name = file.filename.lower()
+    if not name.endswith(_LINE_SUFFIXES + _DOC_SUFFIXES):
+        raise HTTPException(
+            422, f"Unsupported file type. Accepted: {', '.join(_LINE_SUFFIXES + _DOC_SUFFIXES)}."
+        ) from None
+
     data = await file.read()
-    if len(data) > MAX_UPLOAD_MB * 1024 * 1024:
-        raise HTTPException(413, f"Upload exceeds {MAX_UPLOAD_MB} MB.")
-    resolved_backend = backend or _default_backend()
-    with tempfile.TemporaryDirectory() as tmpdir:
-        input_path = _normalize_upload(file.filename, data, tmpdir)
-        return await _extract_common(input_path, resolved_backend, top_k)
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, f"File too large. Maximum size is {MAX_UPLOAD_MB} MB.") from None
+
+    suffix = ".teitok.xml" if name.endswith(".teitok.xml") else Path(name).suffix
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(data)
+        tmp_path = tmp.name
+    try:
+        result = await _extract_from_path(tmp_path, file.filename, engine)
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+    return _envelope(engine, _doc_id(file.filename), result)
 
 
 @app.post("/extract_keywords_text")
 async def extract_keywords_text(payload: Dict[str, Any]):
+    """Line-level extraction from an inline JSON ``{"lines": [...]}`` body (§4.3 sibling).
+
+    ``lines`` items may be plain strings or objects with a ``text`` field; agents can call
+    without materializing a file.
+    """
+    engine = _require_engine()
     lines = payload.get("lines")
     if not isinstance(lines, list) or not lines:
-        raise HTTPException(422, "'lines' must be a non-empty list.")
+        raise HTTPException(422, "'lines' must be a non-empty list.") from None
+
     rows: List[Dict[str, Any]] = []
     for i, item in enumerate(lines, start=1):
-        if isinstance(item, str) and item.strip():
-            rows.append({"text": item.strip(), "page_num": 1, "line_num": i})
+        if isinstance(item, str):
+            rows.append({"page_num": 1, "line_num": i, "text": item, "categ": "", "quality_score": 0.0})
         elif isinstance(item, dict) and item.get("text"):
-            rows.append(item)
+            rows.append(
+                {
+                    "page_num": item.get("page_num", 1),
+                    "line_num": item.get("line_num", i),
+                    "text": item["text"],
+                    "categ": item.get("categ", ""),
+                    "quality_score": item.get("quality_score", 0.0),
+                }
+            )
     if not rows:
-        raise HTTPException(422, "No usable text lines in 'lines'.")
+        raise HTTPException(422, "No usable text lines found in 'lines'.") from None
+
     doc_id = str(payload.get("doc_id", "document"))
-    backend = str(payload.get("backend") or _default_backend())
-    top_k = int(payload.get("top_k", 10))
-    with tempfile.TemporaryDirectory() as tmpdir:
-        input_path = _rows_to_temp_csv(rows, tmpdir, doc_id)
-        return await _extract_common(input_path, backend, top_k)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".csv", mode="w", newline="", encoding="utf-8") as tmp:
+        writer = csv.DictWriter(tmp, fieldnames=["page_num", "line_num", "text", "categ", "quality_score"])
+        writer.writeheader()
+        writer.writerows(rows)
+        tmp_path = tmp.name
+    try:
+        result = await _extract_from_path(tmp_path, f"{doc_id}.csv", engine)
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+    return _envelope(engine, doc_id, result)
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("service.api:app", host="0.0.0.0", port=8000)

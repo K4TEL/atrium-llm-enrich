@@ -1,5 +1,8 @@
-# service/requirements.txt — API-layer deps on top of requirements_remote.txt.
-# The API deliberately reuses the torch-free remote stack (pydantic, requests).
-fastapi
-uvicorn
-python-multipart
+# service/requirements.txt — atrium-llm-enrich API service (strategy §4).
+# The API reuses the torch-free enrichment engine (llm_client_shared + the
+# openrouter/ollama clients), so it needs only the light remote stack plus the
+# web server — never torch/transformers/vllm.
+-r ../requirements_remote.txt
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9

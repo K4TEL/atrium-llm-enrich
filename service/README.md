@@ -1,142 +1,116 @@
-# LLM enrichment API service 🗝️
+# llm-enrich API service 🧠
 
-FastAPI entry point for the ATRIUM llm-enrich pipeline: upload document text
-lines, get back **vocabulary-guided archaeological keywords** (Czech + English)
-with a TEATER/AMCR thematic category and a confidence score per line. The
-service wraps the existing remote/lightweight LLM clients
-(`openrouter_client.py`, `ollama_client.py`) through `llm_client_shared.py`;
-the torch stack is **not** imported (`backend=local` is CLI-only on the
-development branch and answers HTTP 501 here). The service version is read from
-`para_config.txt` `[tool]` (single source of truth, never hard-coded).
+LLM-based archaeological keyword extraction: text lines / documents in → per-line (or
+per-document) `extracted_keywords_cs` / `extracted_keywords_en` out. The service version is
+read from `para_config.txt` `[tool]` (single source of truth, never hard-coded).
+
+It wraps the **torch-free** remote / lightweight-local engine (`llm_client_shared` +
+`openrouter_client` / `ollama_client`), so it never needs the GPU stack.
 
 ## Quick start
 
 ```bash
-pip install -r requirements_remote.txt -r service/requirements.txt
-export OPENROUTER_API_KEY=sk-or-...          # or run a local Ollama server
+pip install -r service/requirements.txt
+
+# choose a backend and give it a key/model, then launch:
+export LLM_BACKEND=openrouter OPENROUTER_API_KEY=sk-... OPENROUTER_MODEL=openai/gpt-4o-mini
 uvicorn service.api:app --host 0.0.0.0 --port 8000
 # or:
 docker compose --profile api up -d
 ```
 
-A minimal demo frontend is served at `http://localhost:8000/frontend/`.
-
-> [!NOTE]
-> On first start the TEATER/AMCR vocabulary is auto-synced from the AMCR
-> OAI-PMH API when the cache file is missing — this can take minutes and needs
-> outbound network access. `/health?deep=true` reports readiness.
+Without a configured backend the service still starts: `/info` and `/health` respond and
+report `ready: false`, while the extraction endpoints return `503` until configured.
 
 ## Endpoints
 
-| Method | Path                     | Purpose                                                                                       |
-|--------|--------------------------|-----------------------------------------------------------------------------------------------|
-| GET    | `/`                      | redirects to the demo frontend                                                                |
-| GET    | `/info`                  | service identity + capabilities: `service`, `version`, `endpoints`, `limits`, backends, vocab |
-| GET    | `/health`                | liveness probe; `?deep=true` verifies vocabulary readiness + the selected backend (503 on fail)|
-| POST   | `/extract_keywords`      | **file entry point** — upload TXT / CSV / TEITOK XML                                          |
-| POST   | `/extract_keywords_text` | same pipeline for inline JSON lines                                                           |
+| Method | Path                     | Purpose                                                                            |
+|--------|--------------------------|------------------------------------------------------------------------------------|
+| GET    | `/info`                  | service identity + capabilities: `service`, `version`, `endpoints`, `limits`, `backend`, `model`, `ready`, `supported_inputs`, `languages` |
+| GET    | `/health`                | liveness probe; `?deep=true` additionally checks the backend is configured (503 on fail) |
+| POST   | `/extract_keywords`      | extract keywords from an uploaded document                                          |
+| POST   | `/extract_keywords_text` | extract keywords from an inline JSON `{"lines": [...]}` body                        |
 
 ### `POST /extract_keywords` (multipart form)
 
-| Field     | Default          | Notes                                                                    |
-|-----------|------------------|--------------------------------------------------------------------------|
-| `file`    | *required*       | `.txt` (plain lines), `.csv` (needs a `text` column), or `.teitok.xml`   |
-| `backend` | server default   | `openrouter` \| `ollama` (\| `local` → 501, CLI-only)                    |
-| `top_k`   | `10`             | max keywords per line, 1–50                                              |
+| Field  | Default    | Notes                                                                          |
+|--------|------------|--------------------------------------------------------------------------------|
+| `file` | *required* | `.csv` / `*.teitok.xml` → line-level; `.md` / `.txt` → document-level          |
 
-Convert ALTO XML to TEITOK/CSV first (`api_util/` tooling on the development
-branch) — raw ALTO uploads fail with 422 (no TEITOK rows), other suffixes with 415.
-
-### `POST /extract_keywords_text` (JSON)
-
-```json
-{ "doc_id": "CTX1", "lines": ["Výzkum odhalil základy kostela."],
-  "backend": "openrouter", "top_k": 10 }
+```bash
+curl -X POST "http://localhost:8000/extract_keywords" -F "file=@sample.csv"
+curl -X POST "http://localhost:8000/extract_keywords_text" \
+     -H "Content-Type: application/json" -d '{"lines": ["Výzkum odhalil základy gotického kostela."]}'
+curl -s http://localhost:8000/info
 ```
 
-### Response envelope
+### Response schema
 
 ```json
 {
-  "doc_id": "CTX1",
+  "service": "atrium-llm-enrich",
+  "doc_id": "sample",
   "backend": "openrouter",
   "model": "openai/gpt-4o-mini",
-  "vocabulary": "TEATER/AMCR",
-  "stats": {"processed": 2, "skipped_filter": 0, "skipped_error": 0, "aborted": 0},
-  "lines": [
+  "mode": "line",
+  "results": [
     {
-      "page": 1, "line": 1,
-      "text": "Výzkum odhalil základy kostela.",
-      "keywords_cs": ["základy kostela"],
-      "keywords_en": ["church foundations"],
-      "category": "kostel",
-      "confidence": 0.92
+      "file_id": "sample",
+      "page": "1",
+      "line": "1",
+      "original_text": "Výzkum odhalil základy gotického kostela.",
+      "enrichment": {
+        "extracted_keywords_cs": ["základy", "gotický kostel"],
+        "extracted_keywords_en": ["foundations", "Gothic church"]
+      }
     }
-  ]
+  ],
+  "stats": {"processed": 1, "skipped_filter": 0, "skipped_error": 0}
 }
 ```
 
-| Field         | Type  | Description                                                             |
-|---------------|-------|-------------------------------------------------------------------------|
-| `keywords_cs` | list  | Czech terms extracted from the line (not copied from the vocabulary)    |
-| `keywords_en` | list  | English translations of `keywords_cs`                                   |
-| `category`    | str   | the single most relevant TEATER/AMCR vocabulary category                |
-| `confidence`  | float | category confidence [0–1] (usable as a filter threshold)                |
-| `stats`       | obj   | per-request run statistics (`processed`/`skipped_filter`/`skipped_error`/`aborted`) |
+| Field     | Type   | Description                                                       |
+|-----------|--------|------------------------------------------------------------------|
+| `service` | str    | canonical tool id (`atrium-llm-enrich`)                          |
+| `doc_id`  | str    | document id derived from the upload filename                     |
+| `backend` | str    | active LLM backend (`openrouter` / `ollama`)                    |
+| `mode`    | str    | `line` (CSV/TEITOK) or `document` (MD/TXT)                       |
+| `results` | list   | per-line/per-document records; `enrichment` holds the keywords   |
+| `stats`   | object | processed / filtered / errored counts (+ `aborted` on abort)     |
 
 ## Errors
 
-| Code        | Meaning                                                                    |
-|-------------|-----------------------------------------------------------------------------|
-| 413         | upload exceeds `MAX_UPLOAD_MB`, or line count exceeds `MAX_LINES`          |
-| 415         | unsupported media type (e.g. raw ALTO XML)                                 |
-| 422         | unusable input (no text rows, bad `backend`/`top_k`)                       |
-| 429         | busy — `MAX_CONCURRENT_JOBS` reached; retry later                          |
-| 501         | `backend=local` requested (CLI-only in this release)                       |
-| 503         | backend unconfigured/unreachable, or vocabulary warmup failed              |
-| 504         | extraction exceeded `API_JOB_TIMEOUT`                                      |
-| 502/503/504 | **clients retry 3×** (warmup/proxy)                                        |
+| Code        | Meaning                                                        |
+|-------------|----------------------------------------------------------------|
+| 413         | payload too large (`MAX_UPLOAD_MB`)                            |
+| 422         | unusable input (missing filename, unsupported type, no lines)  |
+| 500         | processing failure                                             |
+| 502         | upstream LLM backend error (client retries)                    |
+| 503         | backend not configured / not ready (client retries)            |
 
 ## Configuration (environment)
 
-| Variable              | Default      | Meaning                                                            |
-|-----------------------|--------------|--------------------------------------------------------------------|
-| `BACKEND`             | `openrouter` | default backend when the request does not specify one              |
-| `OPENROUTER_API_KEY`  | —            | required for the openrouter backend                                |
-| `OPENROUTER_MODEL`    | (config)     | falls back to `llm_config.txt`                                     |
-| `OLLAMA_HOST`         | `http://localhost:11434` | Ollama server for the ollama backend                   |
-| `OLLAMA_MODEL`        | (config)     | falls back to `llm_config.txt`                                     |
-| `MAX_UPLOAD_MB`       | `5`          | upload size guard                                                  |
-| `MAX_LINES`           | `300`        | per-request line cap (LLM cost/time budget guard)                  |
-| `MAX_CONCURRENT_JOBS` | `1`          | concurrent extractions (LLM calls are the slowest in the family)   |
-| `API_JOB_TIMEOUT`     | `1800`       | per-request timeout in seconds                                     |
-| `ALLOWED_ORIGINS`     | `*`          | CSV of CORS origins                                                |
-| `HF_TOKEN`            | —            | only the batch `llm` image needs it (not the API)                  |
+| Variable             | Default                    | Meaning                                        |
+|----------------------|----------------------------|------------------------------------------------|
+| `LLM_BACKEND`        | `openrouter`               | `openrouter` or `ollama`                       |
+| `OPENROUTER_API_KEY` | —                          | key for the OpenRouter backend                 |
+| `OPENROUTER_MODEL`   | —                          | OpenRouter model id                            |
+| `OLLAMA_HOST`        | `http://localhost:11434`   | Ollama server URL                              |
+| `OLLAMA_MODEL`       | —                          | Ollama model tag                               |
+| `VOCAB_PATH`         | from `llm_config.txt`      | archaeological vocabulary JSON                  |
+| `MAX_UPLOAD_MB`      | `10`                       | canonical upload limit                          |
+| `ALLOWED_ORIGINS`    | `*`                        | CSV of CORS origins                             |
+| `LLM_TIMEOUT`        | `300`                      | per-call read timeout (s)                       |
 
 ## How it works
 
-Requests are normalized to the canonical `text[,page_num,line_num,categ,quality_score]`
-row form, then run through `llm_client_shared.run_line_level()` — the same
-quality filter, ±2-line context windows, vocabulary-constrained JSON schema,
-and lenient validation used by the batch clients — so API results are
-comparable with CLI runs. Line-level records are mapped to the
-`keywords_cs/keywords_en/category/confidence` envelope above. LLM calls are
-the slowest in the ATRIUM family: the API is synchronous with a strict
-concurrency guard; adopting nlp-enrich's async jobs pattern is the planned
-fast-follow if sync proves impractical.
-
-## Frontend
-
-`service/frontend/` is a minimal standalone HTML/JS client mounted at
-`/frontend`: paste lines or upload a file, pick a backend, and inspect the
-keyword table. It links the live API docs (`/docs`, `/openapi.json`).
+On startup the service loads `llm_config.txt` + the archaeological vocabulary, builds the
+system prompt and Pydantic schema once, and binds a `chat_fn` to the chosen backend. Each
+request writes the upload to a temp file and calls `llm_client_shared.run_line_level` (CSV/
+TEITOK) or `run_document_level` (MD/TXT) in a threadpool, so the event loop stays responsive.
+Backend warmup failures are recorded rather than fatal, keeping `/info` and `/health` live.
 
 ## Tests
 
-The hermetic API test suite (mocked chat function, no network) lives on the
-development ([`test`](https://github.com/ufal/atrium-llm-enrich/tree/test))
-branch:
-
-```bash
-pytest tests/test_service_api.py
-```
+`tests/test_api_contract.py` (hermetic, `importorskip("fastapi")`) asserts the §4 meta-contract
+against the in-process `app.openapi()`. Run: `pytest -m "not slow" tests/test_api_contract.py`.
